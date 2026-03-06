@@ -9,6 +9,8 @@ from typing import Optional, TYPE_CHECKING
 
 import httpx
 
+from .base import ToolEvent, ToolEventCallback
+
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
 
@@ -24,6 +26,7 @@ def openai_ask_with_tools(
     tools: dict[str, "ToolDef"],
     system: Optional[str] = None,
     max_rounds: int = 5,
+    on_tool_event: ToolEventCallback = None,
 ) -> tuple[str, list[dict]]:
     """OpenAI-compatible tool calling loop.
 
@@ -66,7 +69,7 @@ def openai_ask_with_tools(
 
     tool_log = []
 
-    for _ in range(max_rounds):
+    for round_num in range(max_rounds):
         payload = {
             "model": model,
             "messages": messages,
@@ -108,12 +111,31 @@ def openai_ask_with_tools(
             except json.JSONDecodeError:
                 tool_args = {}
 
+            if on_tool_event:
+                on_tool_event(ToolEvent(
+                    kind="tool_start",
+                    tool_name=tool_name,
+                    round_num=round_num,
+                    max_rounds=max_rounds,
+                    tool_input=tool_args,
+                ))
+
             result = executor.execute(tool_name, tool_args)
             tool_log.append({
                 "tool": tool_name,
                 "input": tool_args,
                 "output": result,
             })
+
+            if on_tool_event:
+                on_tool_event(ToolEvent(
+                    kind="tool_done",
+                    tool_name=tool_name,
+                    round_num=round_num,
+                    max_rounds=max_rounds,
+                    tool_input=tool_args,
+                    tool_output=result,
+                ))
 
             messages.append({
                 "role": "tool",

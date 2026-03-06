@@ -75,6 +75,19 @@ class ConfigManager:
                 "include_design_language": True,
                 "design_md_path": "",
             },
+            "memory": {
+                # How much cross-provider context to carry between model switches.
+                # off     -> no prior context
+                # summary -> carry compact handoff summary + provider-local turns
+                # full    -> carry recent full transcript across providers
+                "cross_model_memory": "summary",
+                # Re-compact summary every N assistant turns in summary mode.
+                "summary_turn_interval": 6,
+                # Preferred provider to generate summaries (or "auto").
+                "summary_provider": "auto",
+                # Hard cap for compact summary text included in prompts.
+                "summary_max_chars": 1800,
+            },
             "hooks": [],
             "tools": {
                 "reflection": True,
@@ -171,6 +184,39 @@ class ConfigManager:
         }
         config = self.data.get("prompts", {})
         return {**defaults, **config} if config else defaults
+
+    def get_memory_config(self) -> Dict[str, Any]:
+        """Get memory behavior configuration."""
+        defaults: Dict[str, Any] = {
+            "cross_model_memory": "summary",
+            "summary_turn_interval": 6,
+            "summary_provider": "auto",
+            "summary_max_chars": 1800,
+        }
+        config = self.data.get("memory", {})
+        merged = {**defaults, **(config or {})}
+
+        policy = str(merged.get("cross_model_memory", "summary")).lower()
+        if policy not in ("off", "summary", "full"):
+            policy = "summary"
+        merged["cross_model_memory"] = policy
+
+        try:
+            interval = int(merged.get("summary_turn_interval", 6))
+        except Exception:
+            interval = 6
+        merged["summary_turn_interval"] = max(1, interval)
+
+        try:
+            max_chars = int(merged.get("summary_max_chars", 1800))
+        except Exception:
+            max_chars = 1800
+        merged["summary_max_chars"] = max(400, max_chars)
+
+        provider = str(merged.get("summary_provider", "auto") or "auto").lower()
+        merged["summary_provider"] = provider
+
+        return merged
 
     def get_hooks_config(self) -> list:
         """Get hooks configuration (list of hook definitions)."""

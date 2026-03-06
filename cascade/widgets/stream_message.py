@@ -144,7 +144,7 @@ class _ProseBody(Static):
 
     def set_content(self, content: str) -> None:
         self._content = content
-        self.refresh()
+        self.refresh(layout=True)
 
     def render(self) -> Text:
         if not self._content:

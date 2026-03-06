@@ -208,9 +208,10 @@ class ThinkingIndicator(Static):
     }
     """
 
-    def __init__(self, provider: str = "gemini", **kwargs) -> None:
+    def __init__(self, provider: str = "gemini", label: str = "thinking...", **kwargs) -> None:
         super().__init__(**kwargs)
         self._provider = provider
+        self._label = label
         self._idx = 0
         self._timer = None
 
@@ -225,10 +226,15 @@ class ThinkingIndicator(Static):
         if self._timer:
             self._timer.stop()
 
+    def set_label(self, label: str) -> None:
+        """Update activity label while the spinner is active."""
+        self._label = label
+        self.refresh()
+
     def render(self) -> Text:
         accent = get_accent(self._provider)
         ch = self.SPINNER_FRAMES[self._idx]
         t = Text()
         t.append(ch, style=f"bold {accent}")
-        t.append(" thinking...", style=f"dim {PALETTE.text_dim}")
+        t.append(f" {self._label}", style=f"dim {PALETTE.text_dim}")
         return t

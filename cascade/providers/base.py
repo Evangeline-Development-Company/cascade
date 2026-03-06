@@ -1,11 +1,26 @@
 """Base provider interface for all AI models."""
 
 from abc import ABC, abstractmethod
-from typing import Optional, Iterator, TYPE_CHECKING
-from dataclasses import dataclass
+from typing import Optional, Iterator, Callable, TYPE_CHECKING
+from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
+
+
+@dataclass(frozen=True)
+class ToolEvent:
+    """Progress event emitted during tool-calling rounds."""
+
+    kind: str  # "tool_start" | "tool_done"
+    tool_name: str
+    round_num: int
+    max_rounds: int
+    tool_input: dict = field(default_factory=dict)
+    tool_output: str = ""
+
+
+ToolEventCallback = Optional[Callable[[ToolEvent], None]]
 
 
 @dataclass
@@ -56,6 +71,7 @@ class BaseProvider(ABC):
         tools: dict[str, "ToolDef"],
         system: Optional[str] = None,
         max_rounds: int = 5,
+        on_tool_event: ToolEventCallback = None,
     ) -> tuple[str, list[dict]]:
         """Ask with tool calling support.
 
@@ -67,6 +83,7 @@ class BaseProvider(ABC):
             tools: Mapping of tool_name -> ToolDef.
             system: Optional system prompt.
             max_rounds: Maximum tool-calling round trips.
+            on_tool_event: Optional callback for tool progress events.
 
         Returns:
             Tuple of (final_text_response, tool_calls_log).
