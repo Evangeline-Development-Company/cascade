@@ -638,6 +638,8 @@ class CommandHandler:
         # Re-read config from disk
         old_providers = set(cli_app.providers.keys())
         cli_app.config = type(cli_app.config)()
+        if hasattr(cli_app, "memory_config") and hasattr(cli_app.config, "get_memory_config"):
+            cli_app.memory_config = cli_app.config.get_memory_config()
 
         # Re-detect credentials and re-init providers.
         # _apply_detected_credentials mutates config and returns None.

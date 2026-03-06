@@ -104,3 +104,32 @@ def test_apply_credential_new_provider():
         config = manager.get_provider_config("openai")
         assert config is not None
         assert config.api_key == "sk-test-token"
+
+
+def test_memory_config_defaults():
+    """Memory config should expose safe defaults."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+        cfg = manager.get_memory_config()
+        assert cfg["cross_model_memory"] == "summary"
+        assert cfg["summary_turn_interval"] >= 1
+        assert cfg["summary_max_chars"] >= 400
+
+
+def test_memory_config_invalid_values_are_sanitized():
+    """Invalid memory config values should fall back to sane values."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+        manager.data["memory"] = {
+            "cross_model_memory": "totally-invalid",
+            "summary_turn_interval": 0,
+            "summary_max_chars": 1,
+            "summary_provider": "",
+        }
+        cfg = manager.get_memory_config()
+        assert cfg["cross_model_memory"] == "summary"
+        assert cfg["summary_turn_interval"] == 1
+        assert cfg["summary_max_chars"] == 400
+        assert cfg["summary_provider"] == "auto"

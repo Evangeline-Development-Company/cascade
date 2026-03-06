@@ -3,7 +3,7 @@
 import json
 from typing import Optional, Iterator, TYPE_CHECKING
 import httpx
-from .base import BaseProvider, ProviderConfig
+from .base import BaseProvider, ProviderConfig, ToolEventCallback
 from .registry import register_provider
 from ._openai_tools import openai_ask_with_tools
 
@@ -85,6 +85,7 @@ class OpenRouterProvider(BaseProvider):
         tools: dict[str, "ToolDef"],
         system: Optional[str] = None,
         max_rounds: int = 5,
+        on_tool_event: ToolEventCallback = None,
     ) -> tuple[str, list[dict]]:
         """OpenAI-compatible tool calling via OpenRouter."""
         return openai_ask_with_tools(
@@ -98,6 +99,7 @@ class OpenRouterProvider(BaseProvider):
             tools=tools,
             system=system,
             max_rounds=max_rounds,
+            on_tool_event=on_tool_event,
         )
 
     def compare(self, prompt: str, system: Optional[str] = None) -> dict:

@@ -34,9 +34,15 @@ class CascadeApp:
 
     def __init__(self):
         self.config = ConfigManager()
+        self.memory_config = self.config.get_memory_config()
         self.credentials = detect_all()
         self._apply_detected_credentials()
         self.providers = {}
+        self._conversation: list[tuple[str, str, str]] = []
+        self._conversation_by_provider: dict[str, list[tuple[str, str]]] = {}
+        self._cross_model_summary: str = ""
+        self._last_provider_for_memory: Optional[str] = None
+        self._summary_turns_since_compact: int = 0
         self._init_providers()
         self.file_ops = FileOpsPlugin()
         self.project = ProjectContext()
@@ -145,6 +151,123 @@ class CascadeApp:
 
         return self.providers[provider_name]
 
+    def _memory_policy(self) -> str:
+        return str(self.memory_config.get("cross_model_memory", "summary"))
+
+    def _build_turn_blocks(
+        self,
+        turns: list[tuple[str, str]],
+        max_turns: int,
+        max_chars: int,
+    ) -> str:
+        if not turns:
+            return ""
+        selected = turns[-max_turns:]
+        blocks = []
+        total = 0
+        for user_text, assistant_text in selected:
+            u = user_text.strip()
+            a = assistant_text.strip()
+            if len(u) > 600:
+                u = u[:600] + "..."
+            if len(a) > 900:
+                a = a[:900] + "..."
+            block = f"User: {u}\nAssistant: {a}"
+            block_len = len(block) + 2
+            if total + block_len > max_chars:
+                continue
+            blocks.append(block)
+            total += block_len
+        return "\n\n".join(blocks)
+
+    def _compact_summary_heuristic(self) -> None:
+        """Refresh cross-model summary without extra model calls."""
+        if not self._conversation:
+            self._cross_model_summary = ""
+            self._summary_turns_since_compact = 0
+            return
+
+        recent = self._conversation[-10:]
+        providers = []
+        goals = []
+        latest_files = []
+        for provider_name, user_text, assistant_text in recent:
+            if provider_name not in providers:
+                providers.append(provider_name)
+            goals.append(user_text.strip().replace("\n", " ")[:140])
+            # Lightweight file hint extraction for handoff continuity.
+            for token in (user_text + "\n" + assistant_text).split():
+                if "/" in token or token.endswith((".py", ".md", ".yaml", ".yml", ".json", ".ts", ".tsx", ".js")):
+                    cleaned = token.strip("`.,:;()[]{}\"'")
+                    if cleaned and cleaned not in latest_files:
+                        latest_files.append(cleaned)
+                if len(latest_files) >= 8:
+                    break
+
+        summary_lines = [
+            "Cross-model handoff summary:",
+            f"- Recent providers: {', '.join(providers[-4:])}",
+        ]
+        if goals:
+            summary_lines.append(f"- Latest objective: {goals[-1]}")
+        if len(goals) > 1:
+            summary_lines.append(f"- Prior objective: {goals[-2]}")
+        if latest_files:
+            summary_lines.append(f"- Files/areas touched: {', '.join(latest_files[:8])}")
+
+        summary = "\n".join(summary_lines)
+        max_chars = int(self.memory_config.get("summary_max_chars", 1800))
+        self._cross_model_summary = summary[:max_chars]
+        self._summary_turns_since_compact = 0
+
+    def _build_conversation_context(self, provider_name: str) -> str:
+        """Build conversation context according to memory policy."""
+        policy = self._memory_policy()
+        if policy == "off":
+            return ""
+
+        if policy == "full":
+            turns = [(u, a) for _p, u, a in self._conversation]
+            blocks = self._build_turn_blocks(turns, max_turns=8, max_chars=6000)
+            if not blocks:
+                return ""
+            return "Conversation history (recent turns):\n\n" + blocks
+
+        # summary mode
+        parts = []
+        if self._cross_model_summary:
+            parts.append(self._cross_model_summary)
+
+        local_turns = self._conversation_by_provider.get(provider_name, [])
+        blocks = self._build_turn_blocks(local_turns, max_turns=5, max_chars=3200)
+        if blocks:
+            parts.append("Current-provider recent turns:\n\n" + blocks)
+
+        return "\n\n".join(parts).strip()
+
+    def record_turn(self, provider_name: str, prompt: str, response: str) -> None:
+        """Record a completed turn for memory context."""
+        self._conversation.append((provider_name, prompt, response))
+        if len(self._conversation) > 48:
+            self._conversation = self._conversation[-48:]
+
+        provider_turns = self._conversation_by_provider.setdefault(provider_name, [])
+        provider_turns.append((prompt, response))
+        if len(provider_turns) > 24:
+            self._conversation_by_provider[provider_name] = provider_turns[-24:]
+
+        policy = self._memory_policy()
+        if policy == "summary":
+            switched = (
+                self._last_provider_for_memory is not None
+                and self._last_provider_for_memory != provider_name
+            )
+            self._summary_turns_since_compact += 1
+            interval = int(self.memory_config.get("summary_turn_interval", 6))
+            if switched or self._summary_turns_since_compact >= interval or not self._cross_model_summary:
+                self._compact_summary_heuristic()
+        self._last_provider_for_memory = provider_name
+
     def ask(
         self,
         prompt: str,
@@ -160,6 +283,9 @@ class CascadeApp:
         pipeline = self.prompt_pipeline
         if context_text:
             pipeline = pipeline.add_layer("repl_context", context_text, PRIORITY_REPL_CONTEXT)
+        history_context = self._build_conversation_context(prov.name)
+        if history_context:
+            pipeline = pipeline.add_layer("conversation_history", history_context, PRIORITY_REPL_CONTEXT)
         if system:
             pipeline = pipeline.add_layer("user_override", system, PRIORITY_USER_OVERRIDE)
 
@@ -194,6 +320,8 @@ class CascadeApp:
 
         if not stream:
             render_response(response, provider=prov.name)
+
+        self.record_turn(prov.name, prompt, response)
 
         # Run AFTER_RESPONSE hooks
         self.hook_runner.run_hooks(HookEvent.AFTER_RESPONSE, context={
