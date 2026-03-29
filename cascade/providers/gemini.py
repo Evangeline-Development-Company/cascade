@@ -76,6 +76,7 @@ class GeminiProvider(BaseProvider):
             return
 
         full_prompt = self._condense_for_cli(messages)
+        workdir = self.get_working_directory()
         if system:
             condensed = self._condense_system_for_cli(system)
             if condensed:
@@ -84,13 +85,18 @@ class GeminiProvider(BaseProvider):
         cmd = [
             self._gemini_bin, "-p", full_prompt,
             "--output-format", "stream-json",
-            "--include-directories", os.getcwd(),
+            "--include-directories", workdir,
         ]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
 
         handler = GeminiEventHandler()
-        cfg = CLIProxyConfig(binary=self._gemini_bin, cli_name="gemini", cmd_args=cmd)
+        cfg = CLIProxyConfig(
+            binary=self._gemini_bin,
+            cli_name="gemini",
+            cmd_args=cmd,
+            cwd=workdir,
+        )
         yield from stream_cli_proxy(cfg, handler, self._emit_activity)
         if handler.last_usage:
             self._last_usage = handler.last_usage

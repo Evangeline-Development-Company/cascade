@@ -6,8 +6,10 @@ ThinkingIndicator -- braille spinner during provider processing
 """
 
 import re
+import time
 
 from rich.text import Text
+from textual import events
 from textual.containers import VerticalScroll
 from textual.widget import Widget
 from textual.app import ComposeResult
@@ -124,6 +126,16 @@ class ChatHistory(VerticalScroll):
     }
     """
 
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        self.scroll_relative(y=-6, animate=False, force=True)
+        event.stop()
+        event.prevent_default()
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        self.scroll_relative(y=6, animate=False, force=True)
+        event.stop()
+        event.prevent_default()
+
 
 class MessageWidget(Widget):
     """A single message row: gutter label + body content."""
@@ -214,8 +226,10 @@ class ThinkingIndicator(Static):
         self._label = label
         self._idx = 0
         self._timer = None
+        self._started_at = time.monotonic()
 
     def on_mount(self) -> None:
+        self._started_at = time.monotonic()
         self._timer = self.set_interval(0.1, self._tick)
 
     def _tick(self) -> None:
@@ -234,7 +248,12 @@ class ThinkingIndicator(Static):
     def render(self) -> Text:
         accent = get_accent(self._provider)
         ch = self.SPINNER_FRAMES[self._idx]
+        elapsed = max(0, int(time.monotonic() - self._started_at))
         t = Text()
         t.append(ch, style=f"bold {accent}")
-        t.append(f" {self._label}", style=f"dim {PALETTE.text_dim}")
+        label = self._label.strip()
+        if elapsed > 0:
+            t.append(f" {label} | {elapsed}s", style=f"dim {PALETTE.text_dim}")
+        else:
+            t.append(f" {label}", style=f"dim {PALETTE.text_dim}")
         return t

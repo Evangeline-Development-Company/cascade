@@ -7,10 +7,12 @@ Bridges to synchronous provider.stream() via run_worker(thread=True).
 import datetime
 
 from rich.text import Text
+from textual import events
 from textual.screen import Screen
 from textual.app import ComposeResult
 from textual.widgets import Input, Static
 
+from ..episodes import generate_episode
 from ..providers.base import ProviderConfig, ToolEvent
 from ..widgets.header import WelcomeHeader, ProviderGhostTable
 from ..widgets.message import ChatHistory, MessageWidget, ThinkingIndicator
@@ -18,8 +20,9 @@ from ..widgets.input_frame import InputFrame
 from ..widgets.status_bar import StatusBar
 from ..widgets.stream_message import StreamMessage
 from ..widgets.tool_call import ToolCallWidget
-from ..theme import PALETTE, MODE_CYCLE, MODES
+from ..theme import PALETTE, MODE_CYCLE, MODES, get_available_modes, get_provider_theme
 from ..commands import CommandHandler
+from ..hooks import HookContext, HookEvent
 
 
 def summarize_user_prompt(prompt: str) -> str:
@@ -40,6 +43,8 @@ class MainScreen(Screen):
         ("escape", "blur_input", "Focus Chat"),
         ("pageup", "scroll_up", "Scroll Up"),
         ("pagedown", "scroll_down", "Scroll Down"),
+        ("home", "scroll_home", "Scroll Top"),
+        ("end", "scroll_end", "Scroll Bottom"),
     ]
 
     def __init__(
@@ -50,9 +55,12 @@ class MainScreen(Screen):
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
+        self._providers = providers or {}
+        if self._providers and active_provider not in self._providers:
+            active_provider = next(iter(self._providers))
+            mode = get_provider_theme(active_provider).default_mode
         self._active_provider = active_provider
         self._mode = mode
-        self._providers = providers or {}
         self._memory_policy = "summary"
         self._summary_turn_interval = 6
         self._summary_provider_pref = "auto"
@@ -63,11 +71,16 @@ class MainScreen(Screen):
         self._header_visible = True
         self._cmd_handler: CommandHandler | None = None
         self._thinking: ThinkingIndicator | None = None
+        self._exit_hook_fired = False
+        self._activity_timer = None
+        self._activity_provider = None
+        self._last_seen_activity = None
 
     def compose(self) -> ComposeResult:
         yield WelcomeHeader(
             active_provider=self._active_provider,
             providers=self._providers,
+            id="welcome_header",
         )
         yield ChatHistory()
         yield InputFrame(
@@ -107,6 +120,15 @@ class MainScreen(Screen):
         if not prompt:
             return
 
+        if self.app.state.is_thinking:
+            if self._cmd_handler and self._cmd_handler.is_command(prompt):
+                cmd = prompt.lstrip("/").split(None, 1)[0].lower()
+                if cmd in {"exit", "quit"}:
+                    self._cmd_handler.handle(prompt)
+                    return
+            self.app.notify("Wait for the current response to finish.")
+            return
+
         # Record in input history for up-arrow recall
         if hasattr(inp, "record"):
             inp.record(prompt)
@@ -118,6 +140,24 @@ class MainScreen(Screen):
         if self._cmd_handler and self._cmd_handler.is_command(prompt):
             self._cmd_handler.handle(prompt)
             return
+
+        # Fire INPUT_RECEIVED hook (can transform prompt)
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is not None:
+            hook_result = cli_app.hook_runner.emit(
+                HookEvent.INPUT_RECEIVED,
+                HookContext(
+                    event=HookEvent.INPUT_RECEIVED.value,
+                    prompt=prompt,
+                    provider=self._active_provider,
+                    mode=self._mode,
+                ),
+            )
+            if hook_result is not None:
+                if hook_result.block:
+                    return
+                if hook_result.transformed_value is not None:
+                    prompt = hook_result.transformed_value
 
         # Hide welcome header on first real message
         if self._header_visible:
@@ -134,7 +174,7 @@ class MainScreen(Screen):
         # Mount user message widget
         chat = self.query_one(ChatHistory)
         chat.mount(MessageWidget("you", summarize_user_prompt(prompt)))
-        chat.scroll_end(animate=False)
+        self._scroll_chat_end(chat, force=True)
 
         # Kick off provider response in a worker thread
         self._send_to_provider(prompt)
@@ -146,18 +186,21 @@ class MainScreen(Screen):
     def _send_to_provider(self, prompt: str) -> None:
         """Start a background worker that calls the synchronous provider."""
         chat = self.query_one(ChatHistory)
+        self._set_input_locked(True)
 
         # Show thinking spinner
         self._thinking = ThinkingIndicator(self._active_provider)
         chat.mount(self._thinking)
-        chat.scroll_end(animate=False)
+        self._scroll_chat_end(chat, force=True)
         self.app.state.set_thinking(self._active_provider, True)
 
         # Mount a StreamMessage that will accumulate chunks
         self._stream_msg = StreamMessage(self._active_provider)
         chat.mount(self._stream_msg)
+        self._scroll_chat_end(chat, force=True)
 
         provider_name = self._active_provider
+        self._start_activity_poll(self._providers.get(provider_name))
         def _worker() -> None:
             self._provider_worker(prompt, provider_name)
 
@@ -215,28 +258,93 @@ class MainScreen(Screen):
         # Build system prompt (no longer includes conversation history)
         final_system = self._build_system_prompt(cli_app, prompt, provider_name)
 
-        # Build conversation history from state
-        from ..conversation import state_messages_to_provider, needs_compaction, compact_messages
+        # Fire CONTEXT_BUILD hook (can inject/modify context)
+        ctx_hook = cli_app.hook_runner.emit(
+            HookEvent.CONTEXT_BUILD,
+            HookContext(
+                event=HookEvent.CONTEXT_BUILD.value,
+                provider=provider_name,
+                prompt=prompt,
+                system_prompt=final_system or "",
+            ),
+        )
+        if ctx_hook and ctx_hook.transformed_value is not None:
+            final_system = str(ctx_hook.transformed_value)
+
+        # Build conversation history from state, injecting episodes
+        from ..conversation import (
+            state_messages_to_provider, needs_compaction,
+            compact_messages, compact_messages_with_episodes,
+        )
+
+        # Episode-based compaction: if approaching context limit, convert
+        # old messages to episodes instead of burning tokens on summarization
+        chat_messages = list(self.app.state.messages)
+        episode_list = list(self.app.state.episodes)
+
         messages = state_messages_to_provider(
-            messages=list(self.app.state.messages),
+            messages=chat_messages,
             target_provider=provider_name,
             policy=self._memory_policy,
             cross_model_summary=self._cross_model_summary,
+            episodes=episode_list if episode_list else None,
         )
 
-        # Auto-compact if approaching context window limit
+        # Auto-compact with episodes if approaching context window limit
         if messages and needs_compaction(messages, provider_name):
             try:
-                messages = compact_messages(messages, prov, keep_recent=6)
-            except Exception:
-                pass  # compaction failure is non-fatal; send uncompacted
+                active_messages = [
+                    msg for msg in chat_messages
+                    if not msg.metadata.get("compacted")
+                ]
+                new_episodes, remaining = compact_messages_with_episodes(
+                    chat_messages, keep_recent=6,
+                )
+                compacted_count = max(len(active_messages) - len(remaining), 0)
+                self.app.call_from_thread(
+                    self.app.state.apply_episode_compaction,
+                    compacted_count,
+                    new_episodes,
+                )
+                # Rebuild messages with the new episodes
+                all_episodes = episode_list + new_episodes
+                messages = state_messages_to_provider(
+                    messages=remaining,
+                    target_provider=provider_name,
+                    policy=self._memory_policy,
+                    cross_model_summary=self._cross_model_summary,
+                    episodes=all_episodes,
+                )
+            except Exception as ep_err:
+                import logging
+                logging.getLogger("cascade").warning("Episode compaction failed: %s", ep_err)
+                try:
+                    messages = compact_messages(messages, prov, keep_recent=6)
+                except Exception as legacy_err:
+                    logging.getLogger("cascade").warning("Legacy compaction also failed: %s", legacy_err)
 
-        # Run hooks
-        from ..hooks import HookEvent
+        # Run BEFORE_ASK hooks (legacy)
         cli_app.hook_runner.run_hooks(HookEvent.BEFORE_ASK, context={
             "prompt": prompt,
             "provider": provider_name,
         })
+
+        # Fire BEFORE_PROVIDER_REQUEST (can inspect/modify messages)
+        req_hook = cli_app.hook_runner.emit(
+            HookEvent.BEFORE_PROVIDER_REQUEST,
+            HookContext(
+                event=HookEvent.BEFORE_PROVIDER_REQUEST.value,
+                provider=provider_name,
+                prompt=prompt,
+                messages=tuple(messages),
+                system_prompt=final_system or "",
+            ),
+        )
+        if req_hook and req_hook.block:
+            self.app.call_from_thread(
+                self._on_stream_error, f"Request blocked by hook: {req_hook.reason}",
+            )
+            return
 
         # Decide: tool-calling path or streaming path
         tool_registry = getattr(cli_app, "tool_registry", None)
@@ -255,26 +363,37 @@ class MainScreen(Screen):
 
     def _stream_worker(self, cli_app, prov, messages, provider_name, final_system):
         """Streaming path -- token-by-token output."""
-        from ..hooks import HookEvent
-
         full_response = []
-        last_seen_activity = None
         # Extract the user prompt for record_turn (last user message)
         prompt = messages[-1]["content"] if messages else ""
         try:
             for chunk in prov.stream(messages, final_system):
                 full_response.append(chunk)
                 self.app.call_from_thread(self._on_stream_chunk, chunk)
-                # Activity is now filtered in the provider layer; poll last_activity
-                if prov.last_activity and prov.last_activity != last_seen_activity:
-                    last_seen_activity = prov.last_activity
-                    self.app.call_from_thread(self._on_stream_activity, last_seen_activity)
 
             response_text = "".join(full_response)
             if hasattr(cli_app, "record_turn"):
                 cli_app.record_turn(provider_name, prompt, response_text)
 
+            # Generate episode for this interaction
             usage = prov.last_usage or (0, 0)
+            total_tokens = usage[0] + usage[1]
+            episode = generate_episode(
+                user_content=prompt,
+                assistant_content=response_text,
+                provider=provider_name,
+                tokens=total_tokens,
+            )
+            self.app.call_from_thread(self.app.state.add_episode, episode)
+            cli_app.hook_runner.emit(
+                HookEvent.EPISODE_GENERATED,
+                HookContext(
+                    event=HookEvent.EPISODE_GENERATED.value,
+                    provider=provider_name,
+                    episode_id=episode.id,
+                ),
+            )
+
             self.app.call_from_thread(
                 self._on_stream_done, provider_name, response_text, usage[0], usage[1],
             )
@@ -290,8 +409,6 @@ class MainScreen(Screen):
 
     def _tool_worker(self, cli_app, prov, messages, provider_name, final_system, tools):
         """Tool-calling path -- non-streaming with tool progress events."""
-        from ..hooks import HookEvent
-
         # Extract the user prompt for record_turn (last user message)
         prompt = messages[-1]["content"] if messages else ""
 
@@ -309,7 +426,26 @@ class MainScreen(Screen):
             if hasattr(cli_app, "record_turn"):
                 cli_app.record_turn(provider_name, prompt, response_text)
 
+            # Generate episode with tool call data
             usage = prov.last_usage or (0, 0)
+            total_tokens = usage[0] + usage[1]
+            episode = generate_episode(
+                user_content=prompt,
+                assistant_content=response_text,
+                provider=provider_name,
+                tokens=total_tokens,
+                tool_log=tool_log,
+            )
+            self.app.call_from_thread(self.app.state.add_episode, episode)
+            cli_app.hook_runner.emit(
+                HookEvent.EPISODE_GENERATED,
+                HookContext(
+                    event=HookEvent.EPISODE_GENERATED.value,
+                    provider=provider_name,
+                    episode_id=episode.id,
+                ),
+            )
+
             self.app.call_from_thread(
                 self._on_tool_done,
                 provider_name, response_text, usage[0], usage[1], tool_log,
@@ -525,9 +661,11 @@ class MainScreen(Screen):
     def _on_stream_chunk(self, chunk: str) -> None:
         """Called from worker thread via app.call_from_thread."""
         if hasattr(self, "_stream_msg"):
-            self._stream_msg.feed(chunk)
             chat = self.query_one(ChatHistory)
-            chat.scroll_end(animate=False)
+            follow = self._should_follow_chat(chat)
+            self._stream_msg.feed(chunk)
+            if follow:
+                self._scroll_chat_end(chat, force=True)
 
     def _on_stream_activity(self, activity: str) -> None:
         """Show live provider activity while waiting for model output."""
@@ -545,12 +683,14 @@ class MainScreen(Screen):
             if self._thinking:
                 self._thinking.set_label(f"{event.tool_name} done")
             chat = self.query_one(ChatHistory)
+            follow = self._should_follow_chat(chat)
             chat.mount(ToolCallWidget(
                 tool_name=event.tool_name,
                 tool_input=event.tool_input,
                 tool_output=event.tool_output,
             ))
-            chat.scroll_end(animate=False)
+            if follow:
+                self._scroll_chat_end(chat, force=True)
 
     def _on_tool_done(
         self,
@@ -561,16 +701,25 @@ class MainScreen(Screen):
         tool_log: list[dict],
     ) -> None:
         """Called when tool-calling loop completes."""
+        self._stop_activity_poll()
+
         # Remove thinking indicator
         if self._thinking:
             self._thinking.remove()
             self._thinking = None
         self.app.state.set_thinking(provider, False)
+        self._set_input_locked(False)
 
         # Feed full response into the StreamMessage
         if hasattr(self, "_stream_msg"):
             self._stream_msg.feed(full_text)
             self._stream_msg.finish()
+            self._stream_msg = None
+
+        try:
+            self._scroll_chat_end(self.query_one(ChatHistory))
+        except Exception:
+            pass
 
         # Record in state + history DB
         total = input_tokens + output_tokens
@@ -597,15 +746,24 @@ class MainScreen(Screen):
         self, provider: str, full_text: str, input_tokens: int, output_tokens: int,
     ) -> None:
         """Called when streaming is complete."""
+        self._stop_activity_poll()
+
         # Remove thinking indicator
         if self._thinking:
             self._thinking.remove()
             self._thinking = None
         self.app.state.set_thinking(provider, False)
+        self._set_input_locked(False)
 
         # Finalize the stream message
         if hasattr(self, "_stream_msg"):
             self._stream_msg.finish()
+            self._stream_msg = None
+
+        try:
+            self._scroll_chat_end(self.query_one(ChatHistory))
+        except Exception:
+            pass
 
         # Record in state + history DB
         total = input_tokens + output_tokens
@@ -630,14 +788,23 @@ class MainScreen(Screen):
 
     def _on_stream_error(self, error_msg: str) -> None:
         """Called when streaming fails."""
+        self._stop_activity_poll()
+
         if self._thinking:
             self._thinking.remove()
             self._thinking = None
         self.app.state.set_thinking(self._active_provider, False)
+        self._set_input_locked(False)
+
+        if hasattr(self, "_stream_msg") and self._stream_msg is not None:
+            self._stream_msg.finish()
+            self._stream_msg = None
 
         chat = self.query_one(ChatHistory)
+        follow = self._should_follow_chat(chat)
         chat.mount(MessageWidget("system", f"Error: {error_msg}"))
-        chat.scroll_end(animate=False)
+        if follow:
+            self._scroll_chat_end(chat, force=True)
 
     # ------------------------------------------------------------------
     # Mode cycling
@@ -645,9 +812,18 @@ class MainScreen(Screen):
 
     def action_cycle_mode(self) -> None:
         previous_provider = self._active_provider
-        current_idx = MODE_CYCLE.index(self._mode)
-        next_idx = (current_idx + 1) % len(MODE_CYCLE)
-        self._mode = MODE_CYCLE[next_idx]
+        available_modes = get_available_modes(self._providers.keys())
+        if not available_modes:
+            available_modes = MODE_CYCLE
+        if self._mode not in available_modes:
+            next_mode = available_modes[0]
+        elif len(available_modes) == 1:
+            return
+        else:
+            current_idx = available_modes.index(self._mode)
+            next_idx = (current_idx + 1) % len(available_modes)
+            next_mode = available_modes[next_idx]
+        self._mode = next_mode
         self._active_provider = MODES[self._mode]["provider"]
 
         # Update state
@@ -675,9 +851,30 @@ class MainScreen(Screen):
         )
         sep = Static(sep_text, classes="bookmark")
         chat.mount(sep)
-        chat.scroll_end(animate=False)
+        self._scroll_chat_end(chat, force=True)
 
         if previous_provider != self._active_provider:
+            # Fire PROVIDER_SWITCH hook
+            cli_app = getattr(self.app, "cli_app", None)
+            if cli_app is not None:
+                cli_app.hook_runner.emit(
+                    HookEvent.PROVIDER_SWITCH,
+                    HookContext(
+                        event=HookEvent.PROVIDER_SWITCH.value,
+                        provider=self._active_provider,
+                        mode=self._mode,
+                        metadata=(("previous_provider", previous_provider),),
+                    ),
+                )
+
+            # Auto-branch on provider switch
+            try:
+                bs = self.app.get_branching_session()
+                label = f"{previous_provider}->{self._active_provider}"
+                bs.create_branch(label=label, provider=self._active_provider)
+            except Exception:
+                pass  # branching failure is non-fatal
+
             self._trigger_summary_compaction(
                 reason=f"switch {previous_provider}->{self._active_provider}",
                 force=True,
@@ -689,6 +886,26 @@ class MainScreen(Screen):
 
     def action_exit_app(self) -> None:
         from .exit import ExitScreen
+
+        if not self._exit_hook_fired:
+            cli_app = getattr(self.app, "cli_app", None)
+            if cli_app is not None:
+                session_id = (
+                    self.app._db_session["id"]
+                    if getattr(self.app, "_db_session", None) is not None
+                    else self.app.state.session_id
+                )
+                cli_app.hook_runner.emit(
+                    HookEvent.ON_EXIT,
+                    HookContext(
+                        event=HookEvent.ON_EXIT.value,
+                        provider=self._active_provider,
+                        mode=self._mode,
+                        session_id=session_id,
+                        metadata=(("messages", str(self.app.state.message_count)),),
+                    ),
+                )
+            self._exit_hook_fired = True
 
         elapsed = self.app.state.elapsed
         minutes = int(elapsed) // 60
@@ -721,3 +938,75 @@ class MainScreen(Screen):
             self.query_one(ChatHistory).scroll_page_down(animate=False)
         except Exception:
             pass
+
+    def action_scroll_home(self) -> None:
+        try:
+            self.query_one(ChatHistory).scroll_home(animate=False)
+        except Exception:
+            pass
+
+    def action_scroll_end(self) -> None:
+        try:
+            self.query_one(ChatHistory).scroll_end(animate=False)
+        except Exception:
+            pass
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        try:
+            self.query_one(ChatHistory).scroll_relative(y=-6, animate=False, force=True)
+            event.stop()
+            event.prevent_default()
+        except Exception:
+            pass
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        try:
+            self.query_one(ChatHistory).scroll_relative(y=6, animate=False, force=True)
+            event.stop()
+            event.prevent_default()
+        except Exception:
+            pass
+
+    def _set_input_locked(self, locked: bool) -> None:
+        try:
+            inp = self.query_one("#main_input", Input)
+            inp.disabled = locked
+            if not locked:
+                inp.focus()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _should_follow_chat(chat: ChatHistory, threshold: float = 2.0) -> bool:
+        try:
+            return (chat.max_scroll_y - chat.scroll_y) <= threshold
+        except Exception:
+            return True
+
+    def _scroll_chat_end(self, chat: ChatHistory, force: bool = False) -> None:
+        if force or self._should_follow_chat(chat):
+            chat.scroll_end(animate=False)
+
+    def _start_activity_poll(self, provider) -> None:
+        self._stop_activity_poll()
+        self._activity_provider = provider
+        self._last_seen_activity = None
+        if provider is None:
+            return
+
+        def _tick() -> None:
+            if self._thinking is None or self._activity_provider is None:
+                return
+            activity = getattr(self._activity_provider, "last_activity", None)
+            if activity and activity != self._last_seen_activity:
+                self._last_seen_activity = activity
+                self._on_stream_activity(activity)
+
+        self._activity_timer = self.set_interval(0.2, _tick)
+
+    def _stop_activity_poll(self) -> None:
+        if self._activity_timer is not None:
+            self._activity_timer.stop()
+            self._activity_timer = None
+        self._activity_provider = None
+        self._last_seen_activity = None

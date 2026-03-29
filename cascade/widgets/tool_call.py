@@ -97,7 +97,7 @@ class _ToolBody(Static):
             if len(result) > 120:
                 result = result[:117] + "..."
             result_oneline = result.replace("\n", " ")
-            t.append(f" -> ", style=f"dim {PALETTE.text_dim}")
+            t.append(" -> ", style=f"dim {PALETTE.text_dim}")
             t.append(result_oneline, style=PALETTE.text_dim)
 
         return t

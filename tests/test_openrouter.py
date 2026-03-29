@@ -1,5 +1,10 @@
 """Tests for the OpenRouter provider."""
 
+from unittest.mock import patch
+
+import httpx
+import pytest
+
 from cascade.providers.base import ProviderConfig
 from cascade.providers.openrouter import OpenRouterProvider
 
@@ -8,12 +13,12 @@ def test_openrouter_accepts_provider_config():
     """OpenRouterProvider should accept a ProviderConfig (not a dict)."""
     config = ProviderConfig(
         api_key="test-key",
-        model="qwen/qwen3.5-35b-a3b",
+        model="qwen/qwen3.5-9b",
     )
     provider = OpenRouterProvider(config)
     assert provider.config is config
     assert provider.config.api_key == "test-key"
-    assert provider.config.model == "qwen/qwen3.5-35b-a3b"
+    assert provider.config.model == "qwen/qwen3.5-9b"
 
 
 def test_openrouter_abc_compliance():
@@ -58,3 +63,80 @@ def test_openrouter_validation_no_key():
     config = ProviderConfig(api_key="", model="test-model")
     provider = OpenRouterProvider(config)
     assert provider.validate() is False
+
+
+def test_openrouter_headers_include_app_attribution():
+    """OpenRouter requests should identify the Cascade app correctly."""
+    config = ProviderConfig(api_key="test-key", model="test-model")
+    provider = OpenRouterProvider(config)
+
+    headers = provider._headers()
+
+    assert headers["HTTP-Referer"] == "https://github.com/Evangeline-Development-Company/cascade"
+    assert headers["X-OpenRouter-Title"] == "Cascade"
+
+
+def test_openrouter_stream_raises_on_http_status_error():
+    """HTTP errors should raise, not be returned as assistant text."""
+    config = ProviderConfig(api_key="test-key", model="test-model")
+    provider = OpenRouterProvider(config)
+
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(503, request=request)
+
+    class _StreamContext:
+        def __enter__(self):
+            return response
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    with patch.object(provider.client, "stream", return_value=_StreamContext()):
+        with pytest.raises(RuntimeError, match="503"):
+            list(provider.stream_single("Reply with exactly OK."))
+
+
+def test_openrouter_stream_falls_back_on_retryable_status():
+    """Retryable provider-routing failures should retry once with the fallback model."""
+    config = ProviderConfig(
+        api_key="test-key",
+        model="qwen/qwen3.5-9b",
+        fallback_model="minimax/minimax-m2.5",
+    )
+    provider = OpenRouterProvider(config)
+
+    failing_request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    failing_response = httpx.Response(503, request=failing_request)
+
+    class _FailingContext:
+        def __enter__(self):
+            return failing_response
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _SuccessResponse:
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"OK"}}]}'
+            yield 'data: {"usage":{"prompt_tokens":7,"completion_tokens":2},"choices":[]}'
+            yield "data: [DONE]"
+
+    class _SuccessContext:
+        def __enter__(self):
+            return _SuccessResponse()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    with patch.object(provider.client, "stream", side_effect=[_FailingContext(), _SuccessContext()]) as mock_stream:
+        chunks = list(provider.stream_single("Reply with exactly OK."))
+
+    assert chunks == ["OK"]
+    assert provider.last_usage == (7, 2)
+    first_call = mock_stream.call_args_list[0].kwargs["json"]
+    second_call = mock_stream.call_args_list[1].kwargs["json"]
+    assert first_call["model"] == "qwen/qwen3.5-9b"
+    assert second_call["model"] == "minimax/minimax-m2.5"

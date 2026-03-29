@@ -5,7 +5,7 @@ the same chat completions API format for tool calling.
 """
 
 import json
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 import httpx
 
@@ -28,6 +28,7 @@ def openai_ask_with_tools(
     system: Optional[str] = None,
     max_rounds: int = 5,
     on_tool_event: ToolEventCallback = None,
+    on_usage: Optional[Callable[[tuple[int, int]], None]] = None,
 ) -> tuple[str, list[dict]]:
     """OpenAI-compatible tool calling loop.
 
@@ -73,6 +74,23 @@ def openai_ask_with_tools(
 
     tool_log = []
     content = ""
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    def _capture_usage(data: dict) -> None:
+        nonlocal total_input_tokens, total_output_tokens
+        usage = data.get("usage", {})
+        if not isinstance(usage, dict):
+            return
+        in_t = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+        out_t = usage.get("completion_tokens", usage.get("output_tokens", 0))
+        if isinstance(in_t, int) and isinstance(out_t, int):
+            total_input_tokens += in_t
+            total_output_tokens += out_t
+
+    def _finalize_usage() -> None:
+        if on_usage is not None and (total_input_tokens or total_output_tokens):
+            on_usage((total_input_tokens, total_output_tokens))
 
     for round_num in range(max_rounds):
         payload = {
@@ -88,11 +106,17 @@ def openai_ask_with_tools(
             response = client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
-        except Exception as e:
-            return f"Error: {e}", tool_log
+            _capture_usage(data)
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(str(exc)) from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(str(exc)) from exc
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
 
         choices = data.get("choices", [])
         if not choices:
+            _finalize_usage()
             return "", tool_log
 
         message = choices[0].get("message", {})
@@ -102,6 +126,7 @@ def openai_ask_with_tools(
         content = message.get("content", "") or ""
 
         if not tool_calls or finish_reason != "tool_calls":
+            _finalize_usage()
             return content, tool_log
 
         # Append the assistant message (must include tool_calls)
@@ -148,4 +173,5 @@ def openai_ask_with_tools(
                 "content": result,
             })
 
+    _finalize_usage()
     return content, tool_log

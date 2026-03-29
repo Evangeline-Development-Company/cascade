@@ -1,11 +1,17 @@
 """Conversation history conversion and context window management.
 
 Converts CascadeState ChatMessage objects into provider-ready Message dicts,
-with support for cross-model context policies and automatic compaction
-when conversations approach the model's context limit.
+with support for cross-model context policies, episode-based compaction,
+and automatic compaction when conversations approach the model's context limit.
+
+Episode-based compaction (inspired by Slate's Thread Weaving) replaces
+lossy LLM summarization with structured episode records that preserve
+key decisions, artifacts, and outcomes without burning model tokens.
 """
 
 from typing import TYPE_CHECKING
+
+from .episodes import Episode, compact_to_episodes, episodes_to_context
 
 if TYPE_CHECKING:
     from .state import ChatMessage
@@ -28,6 +34,7 @@ def state_messages_to_provider(
     target_provider: str,
     policy: str = "summary",
     cross_model_summary: str = "",
+    episodes: list[Episode] | None = None,
     max_messages: int = 40,
     max_chars: int = 80_000,
 ) -> list["Message"]:
@@ -37,18 +44,39 @@ def state_messages_to_provider(
     - "off": Only include messages from target_provider (and user messages)
     - "summary": Include cross-model summary + recent same-provider turns
     - "full": Include all recent messages regardless of provider
+
+    When episodes are provided, they're injected as structured context
+    before the raw messages, replacing the need for lossy summarization.
     """
     result: list[dict] = []
+    visible_messages = [
+        msg for msg in messages
+        if not msg.metadata.get("compacted")
+    ]
+
+    # Inject episode context first (if available)
+    if episodes:
+        episode_context = episodes_to_context(episodes, max_chars=max_chars // 4)
+        if episode_context:
+            result.append({
+                "role": "user",
+                "content": f"[Prior session context]\n{episode_context}",
+            })
+            result.append({
+                "role": "assistant",
+                "content": "Understood, I have the episode context from prior interactions.",
+            })
 
     if policy == "off":
-        for msg in messages[-max_messages:]:
+        for msg in visible_messages[-max_messages:]:
             if msg.role == "you":
                 result.append({"role": "user", "content": msg.content})
             elif msg.role == target_provider:
                 result.append({"role": "assistant", "content": msg.content})
 
     elif policy == "summary":
-        if cross_model_summary:
+        if cross_model_summary and not episodes:
+            # Only inject old-style summary if no episodes available
             result.append({
                 "role": "user",
                 "content": f"[Context from previous model interactions]\n{cross_model_summary}",
@@ -57,14 +85,14 @@ def state_messages_to_provider(
                 "role": "assistant",
                 "content": "Understood, I have the context from the previous interactions.",
             })
-        for msg in messages[-max_messages:]:
+        for msg in visible_messages[-max_messages:]:
             if msg.role == "you":
                 result.append({"role": "user", "content": msg.content})
             elif msg.role == target_provider:
                 result.append({"role": "assistant", "content": msg.content})
 
     elif policy == "full":
-        for msg in messages[-max_messages:]:
+        for msg in visible_messages[-max_messages:]:
             if msg.role == "you":
                 result.append({"role": "user", "content": msg.content})
             elif msg.role == target_provider:
@@ -100,17 +128,35 @@ def needs_compaction(messages: list["Message"], provider: str) -> bool:
     return estimate_tokens(messages) > int(window * COMPACTION_THRESHOLD)
 
 
+def compact_messages_with_episodes(
+    chat_messages: list["ChatMessage"],
+    keep_recent: int = 6,
+) -> tuple[list[Episode], list["ChatMessage"]]:
+    """Episode-based compaction: convert old messages to episodes.
+
+    Instead of burning model tokens on summarization, this extracts
+    structured episodes from older messages. Episodes are compact,
+    lossless for key information, and work across model switches.
+
+    Returns:
+        Tuple of (episodes, recent_messages).
+    """
+    active_messages = [
+        msg for msg in chat_messages
+        if not msg.metadata.get("compacted")
+    ]
+    return compact_to_episodes(active_messages, keep_recent=keep_recent)
+
+
 def compact_messages(
     messages: list["Message"],
     provider: "BaseProvider",
     keep_recent: int = 6,
 ) -> list["Message"]:
-    """Compact older messages into a summary, keeping recent ones intact.
+    """Legacy compaction: summarize older messages via model call.
 
-    Uses the provider's own ask_single to generate a concise handoff
-    summary of the older conversation turns.  Returns a new message
-    list with the summary prepended and the *keep_recent* most recent
-    messages appended unchanged.
+    Kept as fallback when episode-based compaction is not available.
+    Prefer compact_messages_with_episodes() for new code.
     """
     if len(messages) <= keep_recent:
         return list(messages)

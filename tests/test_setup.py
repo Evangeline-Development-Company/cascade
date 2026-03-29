@@ -54,3 +54,29 @@ def test_setup_wizard_creates(tmp_path):
     wizard = SetupWizard(config=config)
     assert wizard.registry is not None
     assert len(wizard.registry) >= 4
+
+
+def test_openrouter_setup_prompts_for_custom_model(tmp_path):
+    """First-run setup should allow overriding the OpenRouter model slug."""
+    config = ConfigManager(config_path=str(tmp_path / "config.yaml"))
+    wizard = SetupWizard(config=config)
+
+    class _StubProvider:
+        def __init__(self, provider_config):
+            self.config = provider_config
+
+        def ping(self):
+            return True
+
+    wizard.registry = {"openrouter": _StubProvider}
+
+    with patch.object(
+        wizard,
+        "_prompt",
+        side_effect=["y", "qwen/qwen3-coder-next"],
+    ):
+        assert wizard._configure_provider("openrouter", "test-key") is True
+
+    provider_cfg = config.data["providers"]["openrouter"]
+    assert provider_cfg["model"] == "qwen/qwen3-coder-next"
+    assert provider_cfg["fallback_model"] == "minimax/minimax-m2.5"

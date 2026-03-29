@@ -1,6 +1,8 @@
 """Base provider interface for all AI models."""
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+import os
 from typing import Optional, Iterator, Callable, TypedDict, TYPE_CHECKING
 from dataclasses import dataclass, field
 
@@ -39,6 +41,7 @@ class ProviderConfig:
     base_url: Optional[str] = None
     temperature: float = 0.7
     max_tokens: Optional[int] = None
+    fallback_model: Optional[str] = None
 
 
 class BaseProvider(ABC):
@@ -52,6 +55,7 @@ class BaseProvider(ABC):
         self._last_usage: Optional[tuple[int, int]] = None
         self._last_activity: Optional[str] = None
         self._emit_activity: bool = False
+        self._workdir_override: Optional[str] = None
 
     @property
     def last_usage(self) -> Optional[tuple[int, int]]:
@@ -68,6 +72,20 @@ class BaseProvider(ABC):
         if not self._emit_activity:
             return None
         return f"{self._ACTIVITY_PREFIX}{message}"
+
+    def get_working_directory(self) -> str:
+        """Return the provider's effective working directory."""
+        return self._workdir_override or os.getcwd()
+
+    @contextmanager
+    def working_directory(self, path: str):
+        """Temporarily override the provider working directory."""
+        previous = self._workdir_override
+        self._workdir_override = path
+        try:
+            yield
+        finally:
+            self._workdir_override = previous
 
     def _filter_activity(self, chunks: Iterator[str]) -> Iterator[str]:
         """Strip activity prefix messages from stream, storing them for TUI access."""

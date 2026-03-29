@@ -154,6 +154,107 @@ class TestToolExecutor:
         assert executor.has_tool("missing") is False
 
 
+class TestToolExecutorWithHooks:
+    """Tests for ToolExecutor with hook lifecycle integration."""
+
+    def _make_executor_with_hooks(self, hook_defs):
+        from cascade.hooks import HookRunner
+
+        def greet(name: str) -> str:
+            return f"Hello, {name}!"
+
+        tools = {
+            "greet": callable_to_tool_def("greet", greet, "Greet"),
+        }
+        runner = HookRunner(hooks=tuple(hook_defs))
+        return ToolExecutor(tools, hook_runner=runner)
+
+    def test_no_hooks_backward_compat(self):
+        def greet(name: str) -> str:
+            return f"Hello, {name}!"
+
+        tools = {"greet": callable_to_tool_def("greet", greet, "Greet")}
+        executor = ToolExecutor(tools)
+        result = json.loads(executor.execute("greet", {"name": "World"}))
+        assert result["result"] == "Hello, World!"
+
+    def test_hook_blocks_tool(self):
+        from cascade.hooks import HookEvent, HookDefinition, HookResult
+
+        def blocker(ctx):
+            return HookResult(block=True, reason="Dangerous tool")
+
+        executor = self._make_executor_with_hooks([
+            HookDefinition(name="blocker", event=HookEvent.TOOL_CALL, handler=blocker),
+        ])
+        result = json.loads(executor.execute("greet", {"name": "World"}))
+        assert "error" in result
+        assert "blocked" in result["error"].lower()
+        assert "Dangerous tool" in result["error"]
+
+    def test_hook_transforms_arguments(self):
+        from cascade.hooks import HookEvent, HookDefinition, HookResult
+
+        def transformer(ctx):
+            return HookResult(transformed_value={"name": "Transformed"})
+
+        executor = self._make_executor_with_hooks([
+            HookDefinition(name="transformer", event=HookEvent.TOOL_CALL, handler=transformer),
+        ])
+        result = json.loads(executor.execute("greet", {"name": "Original"}))
+        assert result["result"] == "Hello, Transformed!"
+
+    def test_hook_transforms_result(self):
+        from cascade.hooks import HookEvent, HookDefinition, HookResult
+
+        def result_transformer(ctx):
+            return HookResult(transformed_value="Modified result")
+
+        executor = self._make_executor_with_hooks([
+            HookDefinition(name="rt", event=HookEvent.TOOL_RESULT, handler=result_transformer),
+        ])
+        result = json.loads(executor.execute("greet", {"name": "World"}))
+        assert result["result"] == "Modified result"
+
+    def test_hook_invalid_transform_type(self):
+        from cascade.hooks import HookEvent, HookDefinition, HookResult
+
+        def bad_transformer(ctx):
+            return HookResult(transformed_value="not a dict")
+
+        executor = self._make_executor_with_hooks([
+            HookDefinition(name="bad", event=HookEvent.TOOL_CALL, handler=bad_transformer),
+        ])
+        result = json.loads(executor.execute("greet", {"name": "World"}))
+        assert "error" in result
+        assert "invalid arguments type" in result["error"].lower()
+
+    def test_hook_error_does_not_crash(self):
+        from cascade.hooks import HookEvent, HookDefinition
+
+        def crasher(ctx):
+            raise RuntimeError("Hook exploded")
+
+        executor = self._make_executor_with_hooks([
+            HookDefinition(name="crash", event=HookEvent.TOOL_CALL, handler=crasher),
+        ])
+        # Hook error is non-fatal (emit returns None on error), tool runs normally
+        result = json.loads(executor.execute("greet", {"name": "World"}))
+        assert result["result"] == "Hello, World!"
+
+    def test_passthrough_hook(self):
+        from cascade.hooks import HookEvent, HookDefinition
+
+        def noop(ctx):
+            return None
+
+        executor = self._make_executor_with_hooks([
+            HookDefinition(name="noop", event=HookEvent.TOOL_CALL, handler=noop),
+        ])
+        result = json.loads(executor.execute("greet", {"name": "World"}))
+        assert result["result"] == "Hello, World!"
+
+
 class TestReflection:
     """Tests for the reflection tool."""
 

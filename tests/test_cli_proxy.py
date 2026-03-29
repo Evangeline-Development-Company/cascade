@@ -2,9 +2,10 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from cascade.providers._cli_proxy import (
     ACTIVITY_PREFIX,
-    CLIEventHandler,
     CLIProxyConfig,
     ClaudeEventHandler,
     CodexEventHandler,
@@ -113,6 +114,40 @@ def test_activity_messages_emitted():
     assert "model: test-model" in activity_chunks[1]
 
 
+def test_stream_uses_configured_cwd():
+    """CLI proxy subprocesses should honor the configured working directory."""
+    lines = ['{"type":"message","role":"assistant","content":"ok"}\n']
+    handler = GeminiEventHandler()
+    seen = {}
+
+    class _Cls:
+        def __init__(self, *_a, **kwargs):
+            seen.update(kwargs)
+            self.stdout = iter(lines)
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    with patch("cascade.providers._cli_proxy.subprocess.Popen", _Cls):
+        chunks = list(
+            stream_cli_proxy(
+                _cfg(cli_name="gemini", cwd="/tmp/cascade-workdir"),
+                handler,
+                emit_activity=True,
+            )
+        )
+
+    assert chunks[0] == f"{ACTIVITY_PREFIX}starting gemini cli in /tmp/cascade-workdir"
+    assert seen["cwd"] == "/tmp/cascade-workdir"
+
+
 def test_usage_captured_in_handler():
     """Handler should capture usage from result events."""
     lines = [
@@ -128,16 +163,37 @@ def test_usage_captured_in_handler():
 
 
 def test_error_on_nonzero_exit():
-    """Nonzero exit with no text should yield an error."""
+    """Nonzero exit with no text should raise an error."""
     lines = ["something went wrong\n"]
     handler = GeminiEventHandler()
     popen_cls = _make_popen_cls(lines, returncode=1)
 
     with patch("cascade.providers._cli_proxy.subprocess.Popen", popen_cls):
-        chunks = list(stream_cli_proxy(_cfg(cli_name="test"), handler, emit_activity=False))
+        with pytest.raises(RuntimeError, match="something went wrong"):
+            list(stream_cli_proxy(_cfg(cli_name="test"), handler, emit_activity=False))
 
-    assert len(chunks) == 1
-    assert chunks[0] == "Error: something went wrong"
+
+def test_error_on_nonzero_exit_uses_meaningful_multiline_message():
+    """Pretty-printed CLI errors should not collapse to a trailing brace."""
+    lines = [
+        "Attempt 1 failed with status 429. Retrying with backoff... GaxiosError: [{\n",
+        '  "error": {\n',
+        '    "code": 429,\n',
+        '    "message": "No capacity available for model gemini-3.1-pro-preview on the server",\n',
+        '    "status": "RESOURCE_EXHAUSTED"\n',
+        "  }\n",
+        "}\n",
+        "]\n",
+    ]
+    handler = GeminiEventHandler()
+    popen_cls = _make_popen_cls(lines, returncode=1)
+
+    with patch("cascade.providers._cli_proxy.subprocess.Popen", popen_cls):
+        with pytest.raises(
+            RuntimeError,
+            match="No capacity available for model gemini-3.1-pro-preview on the server",
+        ):
+            list(stream_cli_proxy(_cfg(cli_name="gemini"), handler, emit_activity=False))
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +344,25 @@ def test_claude_handler_assistant_fallback():
     }))
     assert ("text", "hello world") in events
     assert handler.last_usage == (8, 3)
+
+
+def test_claude_handler_suppresses_auth_failure_text():
+    """Assistant auth-failure payloads should be captured as errors, not content."""
+    handler = ClaudeEventHandler()
+
+    events = list(handler.on_json_event({
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "Failed to authenticate. API Error: 401"},
+            ],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+        "error": "authentication_failed",
+    }))
+
+    assert events == []
+    assert handler.error_lines == ["Failed to authenticate. API Error: 401"]
 
 
 # ---------------------------------------------------------------------------

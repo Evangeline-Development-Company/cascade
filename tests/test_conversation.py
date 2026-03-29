@@ -7,10 +7,9 @@ from cascade.conversation import (
     estimate_tokens,
     needs_compaction,
     compact_messages,
-    CONTEXT_WINDOWS,
-    COMPACTION_THRESHOLD,
+    compact_messages_with_episodes,
 )
-from cascade.state import ChatMessage
+from cascade.state import CascadeState, ChatMessage
 
 
 def _msgs(*pairs):
@@ -97,6 +96,20 @@ def test_char_budget_trims_oldest():
 def test_empty_messages():
     result = state_messages_to_provider([], "claude", policy="summary")
     assert result == []
+
+
+def test_compacted_messages_are_excluded_from_provider_history():
+    messages = [
+        ChatMessage(role="you", content="old", metadata={"compacted": True}),
+        ChatMessage(role="claude", content="old reply", metadata={"compacted": True}),
+        ChatMessage(role="you", content="new"),
+        ChatMessage(role="claude", content="new reply"),
+    ]
+    result = state_messages_to_provider(messages, "claude", policy="summary")
+    assert result == [
+        {"role": "user", "content": "new"},
+        {"role": "assistant", "content": "new reply"},
+    ]
 
 
 def test_message_format_user_role():
@@ -194,3 +207,27 @@ def test_compact_messages_truncates_old_content_in_transcript():
     prompt = call_args[0][0]
     # Each old message content is truncated to 1000 chars
     assert "x" * 1001 not in prompt
+
+
+def test_episode_compaction_marks_messages_so_it_does_not_repeat():
+    state = CascadeState()
+    state.messages = _msgs(
+        ("you", "Task 1"),
+        ("claude", "Done 1"),
+        ("you", "Task 2"),
+        ("claude", "Done 2"),
+        ("you", "Task 3"),
+        ("claude", "Done 3"),
+        ("you", "Current"),
+        ("claude", "Working"),
+    )
+
+    episodes, remaining = compact_messages_with_episodes(state.messages, keep_recent=2)
+    active_count = len([m for m in state.messages if not m.metadata.get("compacted")])
+    state.apply_episode_compaction(active_count - len(remaining), episodes)
+
+    assert len(state.episodes) == 3
+
+    later_episodes, later_remaining = compact_messages_with_episodes(state.messages, keep_recent=2)
+    assert later_episodes == []
+    assert [m.content for m in later_remaining] == ["Current", "Working"]

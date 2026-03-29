@@ -8,6 +8,7 @@ from typing import Optional, Dict, List, TYPE_CHECKING
 import time
 
 from .history.wordid import generate_word_id
+from .episodes import Episode
 
 from textual.message import Message
 
@@ -99,18 +100,23 @@ class CascadeState:
         self.mode: str = "design"
         self.messages: List[ChatMessage] = []
         self.total_tokens: int = 0
-        self.provider_tokens: Dict[str, int] = {
+        self.provider_tokens: Dict[str, int] = self._default_provider_totals()
+        self.cwd: str = "."
+        self.branch: str = "main"
+        self.episodes: List[Episode] = []
+        self.is_thinking: bool = False
+        self.current_thought: str = ""
+        self.fast_mode: bool = False
+        self._app: Optional["App"] = None
+
+    @staticmethod
+    def _default_provider_totals() -> Dict[str, int]:
+        return {
             "gemini": 0,
             "claude": 0,
             "openai": 0,
             "openrouter": 0,
         }
-        self.cwd: str = "."
-        self.branch: str = "main"
-        self.is_thinking: bool = False
-        self.current_thought: str = ""
-        self.fast_mode: bool = False
-        self._app: Optional["App"] = None
 
     def bind(self, app: "App") -> None:
         """Bind to a Textual App so mutations can post messages."""
@@ -126,6 +132,23 @@ class CascadeState:
         self.active_provider = provider
         self.mode = mode
         self._post(ProviderChanged(provider, mode))
+
+    def set_session_id(self, session_id: str) -> None:
+        self.session_id = session_id
+
+    def reset_session(self, session_id: Optional[str] = None) -> None:
+        """Clear conversation-scoped state when starting or resuming a session."""
+        if session_id is not None:
+            self.session_id = session_id
+        self.messages = []
+        self.total_tokens = 0
+        current_keys = tuple(self.provider_tokens.keys())
+        self.provider_tokens = self._default_provider_totals()
+        for key in current_keys:
+            self.provider_tokens.setdefault(key, 0)
+        self.episodes = []
+        self.is_thinking = False
+        self.current_thought = ""
 
     def add_message(self, role: str, content: str, tokens: int = 0,
                     msg_type: str = "text", metadata: Optional[Dict] = None) -> ChatMessage:
@@ -150,6 +173,26 @@ class CascadeState:
         self.is_thinking = thinking
         self.current_thought = thought
         self._post(ThinkingChanged(provider, thinking, thought))
+
+    def add_episode(self, episode: Episode) -> None:
+        """Record a completed episode for context compaction."""
+        self.episodes.append(episode)
+
+    def apply_episode_compaction(self, compacted_count: int, episodes: List[Episode]) -> None:
+        """Attach new episodes and mark the oldest active messages as compacted."""
+        if compacted_count <= 0 and not episodes:
+            return
+
+        remaining = compacted_count
+        for msg in self.messages:
+            if remaining <= 0:
+                break
+            if msg.metadata.get("compacted"):
+                continue
+            msg.metadata["compacted"] = True
+            remaining -= 1
+
+        self.episodes.extend(episodes)
 
     def post_stream_chunk(self, provider: str, chunk: str, done: bool = False) -> None:
         self._post(StreamChunk(provider, chunk, done))

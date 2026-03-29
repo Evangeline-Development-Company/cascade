@@ -45,6 +45,7 @@ class WelcomeHeader(Widget):
         yield ProviderGhostTable(
             providers=self._providers,
             active_provider=self._active_provider,
+            id="ghost_table",
         )
 
 
@@ -110,7 +111,7 @@ class ProviderGhostTable(Static):
 
         for name in sorted(self._providers.keys()):
             prov = self._providers[name]
-            model = prov.config.model if hasattr(prov, "config") else "?"
+            model = str(getattr(getattr(prov, "config", None), "model", "?") or "?")
             is_active = name == self._active_provider
             pt = get_provider_theme(name)
 

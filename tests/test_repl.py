@@ -1,8 +1,8 @@
 """Tests for the REPL modules."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from cascade.repl import CascadeREPL
+from cascade.repl import CascadeREPL, main
 
 
 def _make_mock_app():
@@ -62,3 +62,14 @@ def test_prompt_repl_importable():
     """CascadePromptREPL should be importable when prompt_toolkit is installed."""
     from cascade.repl_prompt import CascadePromptREPL
     assert CascadePromptREPL is not None
+
+
+def test_repl_main_enables_mouse():
+    cli_app = MagicMock()
+    tui = MagicMock()
+
+    with patch("cascade.cli.CascadeCore", return_value=cli_app):
+        with patch("cascade.app.CascadeTUI", return_value=tui):
+            main()
+
+    tui.run.assert_called_once_with(mouse=True)

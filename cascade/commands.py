@@ -5,10 +5,11 @@ Commands post state messages rather than manipulating widgets directly.
 
 import datetime
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .theme import MODES, PALETTE, get_provider_theme
+from .theme import MODES, PALETTE, get_available_modes, get_provider_theme
 
 
 @dataclass(frozen=True)
@@ -44,10 +45,26 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("history", "/history [limit]", "List recent chat sessions"),
     CommandDef("resume", "/resume <id>", "Resume a previous session"),
     CommandDef("export", "/export [id]", "Export session messages to a file"),
+    CommandDef("swarm", "/swarm <task>", "Multi-model swarm dispatch"),
+    CommandDef(
+        "compete",
+        "/compete [--providers a,b] [--judge x] <task>",
+        "Run the same task across providers and pick a winner",
+    ),
+    CommandDef(
+        "compete-code",
+        "/compete-code [--providers a,b] [--judge x] <task>",
+        "Run a coding task in isolated worktrees and keep the winning workspace",
+    ),
+    CommandDef("episodes", "/episodes", "Show episode history"),
+    CommandDef("tree", "/tree", "Show session branch tree"),
+    CommandDef("branch", "/branch [label]", "Create a branch at current point"),
     CommandDef("mark", "/mark [label]", "Insert a bookmark separator"),
     CommandDef("time", "/time", "Show current time"),
     CommandDef("help", "/help", "Show available commands"),
 )
+
+_PROGRESS_DETAIL_RE = re.compile(r"^\[(?P<provider>[^\]]+)\]\s*(?P<message>.*)$")
 
 
 def get_matching_commands(prefix: str) -> list[CommandDef]:
@@ -101,6 +118,12 @@ class CommandHandler:
             "history": self._cmd_history,
             "resume": self._cmd_resume,
             "export": self._cmd_export,
+            "swarm": self._cmd_swarm,
+            "compete": self._cmd_compete,
+            "compete-code": self._cmd_compete_code,
+            "episodes": self._cmd_episodes,
+            "tree": self._cmd_tree,
+            "branch": self._cmd_branch,
             "mark": self._cmd_mark,
             "time": self._cmd_time,
         }.get(cmd)
@@ -116,15 +139,277 @@ class CommandHandler:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _post_system(self, text: str) -> None:
+    def _post_system(self, text: str, *, force_scroll: bool = True) -> None:
         """Mount a system message in the chat."""
         try:
             from .widgets.message import ChatHistory, MessageWidget
             chat = self.app.screen.query_one(ChatHistory)
             chat.mount(MessageWidget("system", text))
-            chat.scroll_end(animate=False)
+            screen = getattr(self.app, "screen", None)
+            if screen is not None and hasattr(screen, "_scroll_chat_end"):
+                screen._scroll_chat_end(chat, force=force_scroll)
+            else:
+                chat.scroll_end(animate=False)
         except Exception:
             self.app.notify(text)
+
+    def _mount_progress_indicator(self, label: str):
+        """Attach a live spinner row for long-running slash commands."""
+        try:
+            from .widgets.message import ChatHistory, ThinkingIndicator
+
+            provider = getattr(getattr(self.app, "state", None), "active_provider", "gemini")
+            chat = self.app.screen.query_one(ChatHistory)
+            indicator = ThinkingIndicator(provider=provider, label=label)
+            chat.mount(indicator)
+            screen = getattr(self.app, "screen", None)
+            if screen is not None and hasattr(screen, "_scroll_chat_end"):
+                screen._scroll_chat_end(chat, force=True)
+            else:
+                chat.scroll_end(animate=False)
+            return indicator
+        except Exception:
+            return None
+
+    @staticmethod
+    def _set_progress_indicator_label(indicator, label: str) -> None:
+        """Safely update a long-running command spinner label."""
+        if indicator is None:
+            return
+        try:
+            indicator.set_label(label)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_progress_label(
+        providers: list[str],
+        provider_states: dict[str, str],
+        judge_status: str = "",
+    ) -> str:
+        """Render a compact one-line status summary for multi-provider commands."""
+        parts = [
+            f"{provider} {provider_states.get(provider, 'queued')}"
+            for provider in providers
+        ]
+        if judge_status:
+            parts.append(judge_status)
+        return " | ".join(parts)
+
+    @staticmethod
+    def _update_progress_states(
+        stage: str,
+        detail: str,
+        provider_states: dict[str, str],
+        judge_provider: str | None = None,
+    ) -> str:
+        """Apply an on_progress event to the provider-state summary."""
+        if stage == "judging":
+            return f"judge {judge_provider or 'running'}"
+
+        match = _PROGRESS_DETAIL_RE.match(detail or "")
+        if not match:
+            return ""
+
+        provider = match.group("provider").strip().lower()
+        message = match.group("message").strip().lower()
+
+        if stage == "workspace":
+            provider_states[provider] = "prepared"
+        elif stage == "competing":
+            provider_states[provider] = "running"
+        elif stage == "result":
+            if message.startswith("done"):
+                provider_states[provider] = "done"
+            elif message.startswith("failed"):
+                provider_states[provider] = "failed"
+            else:
+                provider_states[provider] = message or "done"
+
+        return ""
+
+    @staticmethod
+    def _clear_progress_indicator(indicator) -> None:
+        """Remove a live spinner row if it was mounted."""
+        if indicator is None:
+            return
+        try:
+            indicator.remove()
+        except Exception:
+            pass
+
+    def _record_history_message(self, role: str, content: str, token_count: int = 0) -> None:
+        """Persist a message to history when the app exposes record_message()."""
+        recorder = getattr(self.app, "record_message", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(role, content, token_count=token_count)
+        except TypeError:
+            recorder(role, content, token_count)
+        except Exception:
+            pass
+
+    def _seed_session_title(self, title: str) -> None:
+        """Set a session title for slash-command-only sessions when needed."""
+        session = getattr(self.app, "_db_session", None)
+        db = getattr(self.app, "db", None)
+        if not session or session.get("title") or db is None:
+            return
+        short = title[:60]
+        try:
+            db.update_session_title(session["id"], short)
+            session["title"] = short
+        except Exception:
+            pass
+
+    def _record_command_line(self, command_line: str, title: str | None = None) -> None:
+        """Persist the slash command invocation as a user message."""
+        self._record_history_message("user", command_line)
+        if title:
+            self._seed_session_title(title)
+
+    @staticmethod
+    def _history_provider_for_message(message: dict, session_provider: str) -> str:
+        """Resolve the provider label for a persisted history message."""
+        stored_role = str(message.get("role", "assistant"))
+        if stored_role == "assistant":
+            return str(message.get("metadata", {}).get("provider") or session_provider or "assistant")
+        return stored_role
+
+    @classmethod
+    def _state_role_for_history_message(cls, message: dict, session_provider: str) -> str:
+        """Map a persisted history role onto the in-memory chat role."""
+        stored_role = str(message.get("role", "assistant"))
+        if stored_role == "user":
+            return "you"
+        if stored_role == "assistant":
+            return cls._history_provider_for_message(message, session_provider)
+        return stored_role
+
+    @staticmethod
+    def _mode_for_provider(provider: str) -> str:
+        """Return the default mode associated with a provider."""
+        for mode_name, mode_cfg in MODES.items():
+            if mode_cfg.get("provider") == provider:
+                return mode_name
+        return "design"
+
+    @staticmethod
+    def _parse_compete_args(
+        args: list[str],
+    ) -> tuple[list[str] | None, str | None, str | None]:
+        """Parse optional provider/judge flags from /compete args."""
+        providers: list[str] | None = None
+        judge: str | None = None
+        index = 0
+
+        while index < len(args):
+            token = args[index]
+            if token == "--providers":
+                index += 1
+                if index >= len(args):
+                    return None, None, None
+                raw = args[index]
+                providers = [name.strip().lower() for name in raw.split(",") if name.strip()]
+                if not providers:
+                    return None, None, None
+                index += 1
+                continue
+            if token.startswith("--providers="):
+                raw = token.split("=", 1)[1]
+                providers = [name.strip().lower() for name in raw.split(",") if name.strip()]
+                if not providers:
+                    return None, None, None
+                index += 1
+                continue
+            if token == "--judge":
+                index += 1
+                if index >= len(args):
+                    return None, None, None
+                judge = args[index].strip().lower() or None
+                if judge is None:
+                    return None, None, None
+                index += 1
+                continue
+            if token.startswith("--judge="):
+                judge = token.split("=", 1)[1].strip().lower() or None
+                if judge is None:
+                    return None, None, None
+                index += 1
+                continue
+            break
+
+        objective = " ".join(args[index:]).strip()
+        if not objective:
+            return None, None, None
+        return providers, judge, objective
+
+    def _resolve_compete_request(
+        self,
+        args: list[str],
+        command_name: str,
+        label: str,
+    ):
+        providers_arg, judge_arg, objective = self._parse_compete_args(args)
+        if objective is None:
+            self._post_system(
+                f"Usage: /{command_name} [--providers a,b] [--judge x] <task description>"
+            )
+            return None
+
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is None:
+            self._post_system(f"{label} requires CLI app.")
+            return None
+
+        available = list(cli_app.providers.keys())
+        if len(available) < 2:
+            self._post_system(
+                f"{label} needs 2+ providers. Have: {available}. "
+                f"Use /login to add more."
+            )
+            return None
+
+        selected = providers_arg or available
+        deduped: list[str] = []
+        for provider_name in selected:
+            if provider_name not in deduped:
+                deduped.append(provider_name)
+        selected = deduped
+
+        invalid = [provider_name for provider_name in selected if provider_name not in cli_app.providers]
+        if invalid:
+            self._post_system(
+                f"{label} provider(s) not found: {', '.join(invalid)}. "
+                f"Available: {', '.join(available)}"
+            )
+            return None
+        if len(selected) < 2:
+            self._post_system(
+                f"{label} needs 2+ selected providers. Selected: {', '.join(selected)}"
+            )
+            return None
+        if judge_arg and judge_arg not in cli_app.providers:
+            self._post_system(
+                f"{label} judge '{judge_arg}' not found. Available: {', '.join(available)}"
+            )
+            return None
+
+        return cli_app, selected, judge_arg, objective
+
+    @staticmethod
+    def _diff_summary(diff_stat: str, changed_files: list[str]) -> str:
+        """Return a short one-line diff summary for competition output."""
+        lines = [line.strip() for line in diff_stat.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
+        file_count = len(changed_files)
+        if file_count == 1:
+            return "1 file changed"
+        if file_count > 1:
+            return f"{file_count} files changed"
+        return "no diff"
 
     def _get_shannon(self):
         """Lazy-init Shannon integration via entry point discovery."""
@@ -198,7 +483,15 @@ class CommandHandler:
             return
         name = args[0].lower()
         from .theme import PROVIDERS
-        if name not in PROVIDERS:
+        cli_app = getattr(self.app, "cli_app", None)
+        configured = list(getattr(cli_app, "providers", {}).keys())
+        if configured:
+            if name not in configured:
+                self.app.notify(
+                    f"Provider '{name}' is not configured. Available: {', '.join(configured)}"
+                )
+                return
+        elif name not in PROVIDERS:
             self.app.notify(f"Provider '{name}' not found. Available: {', '.join(PROVIDERS)}")
             return
         pt = get_provider_theme(name)
@@ -226,10 +519,19 @@ class CommandHandler:
             self.app.notify("Usage: /mode <name>")
             return
         mode_name = args[0].lower()
+        cli_app = getattr(self.app, "cli_app", None)
+        configured = list(getattr(cli_app, "providers", {}).keys())
+        available_modes = get_available_modes(configured)
         if mode_name not in MODES:
-            self.app.notify(f"Mode '{mode_name}' not found. Available: {', '.join(MODES)}")
+            self.app.notify(f"Mode '{mode_name}' not found. Available: {', '.join(available_modes)}")
             return
         provider = MODES[mode_name]["provider"]
+        if configured and provider not in configured:
+            self.app.notify(
+                f"Mode '{mode_name}' is unavailable because provider '{provider}' is not configured. "
+                f"Available modes: {', '.join(available_modes)}"
+            )
+            return
         self.app.state.set_provider(provider, mode_name)
         self.app.state.fast_mode = False
         try:
@@ -764,24 +1066,59 @@ class CommandHandler:
             self._post_system(f"Session '{session_id}' has no messages.")
             return
 
-        # Adopt this session as the current one
-        self.app._db_session = session
+        session_provider = str(session.get("provider", "assistant") or "assistant")
+
+        # Adopt this session as the current one and reset in-memory conversation state.
+        self.app.adopt_session(session)
+        self.app.state.reset_session(session_id=session["id"])
+        if session_provider in getattr(getattr(self.app, "cli_app", None), "providers", {}):
+            restored_mode = self._mode_for_provider(session_provider)
+            self.app.state.set_provider(session_provider, restored_mode)
+            try:
+                self.app.screen._active_provider = session_provider
+                self.app.screen._mode = restored_mode
+            except Exception:
+                pass
 
         # Load messages into state
-        provider = session.get("provider", "assistant")
         for msg in messages:
-            role = "you" if msg["role"] == "user" else provider
+            role = self._state_role_for_history_message(msg, session_provider)
+            token_count = int(msg.get("token_count", 0))
             self.app.state.add_message(
-                role, msg["content"], tokens=msg.get("token_count", 0),
+                role, msg["content"], tokens=token_count,
             )
+            if msg["role"] != "user" and token_count > 0 and role != "system":
+                self.app.state.provider_tokens[role] = (
+                    self.app.state.provider_tokens.get(role, 0) + token_count
+                )
+                self.app.state.total_tokens += token_count
+
+        if len(self.app.state.messages) > 12:
+            try:
+                from .conversation import compact_messages_with_episodes
+
+                new_episodes, remaining = compact_messages_with_episodes(
+                    self.app.state.messages,
+                    keep_recent=6,
+                )
+                compacted_count = max(len(self.app.state.messages) - len(remaining), 0)
+                self.app.state.apply_episode_compaction(compacted_count, new_episodes)
+            except Exception:
+                pass
 
         # Mount message widgets in chat history
         try:
+            from .screens.main import WelcomeHeader
+            from .widgets.header import ProviderGhostTable
+            from .widgets.input_frame import InputFrame
             from .widgets.message import ChatHistory, MessageWidget
+            from .widgets.status_bar import StatusBar
 
             chat = self.app.screen.query_one(ChatHistory)
+            chat.remove_children()
             for msg in messages:
-                if msg["role"] == "user":
+                role = self._state_role_for_history_message(msg, session_provider)
+                if role == "you":
                     content = msg["content"]
                     line_count = content.count("\n") + 1
                     display = (
@@ -791,10 +1128,43 @@ class CommandHandler:
                     )
                     chat.mount(MessageWidget("you", display))
                 else:
-                    chat.mount(MessageWidget(provider, msg["content"]))
+                    chat.mount(MessageWidget(role, msg["content"]))
             chat.scroll_end(animate=False)
+
+            if hasattr(self.app.screen, "_header_visible"):
+                self.app.screen._header_visible = False
+            if hasattr(self.app.screen, "_cross_model_summary"):
+                self.app.screen._cross_model_summary = ""
+            if hasattr(self.app.screen, "_turns_since_summary"):
+                self.app.screen._turns_since_summary = 0
+            if hasattr(self.app.screen, "_summary_compaction_running"):
+                self.app.screen._summary_compaction_running = False
+            self.app.screen.query_one(WelcomeHeader).display = False
+            self.app.screen.query_one(StatusBar).update_tokens(self.app.state.provider_tokens)
+            frame = self.app.screen.query_one(InputFrame)
+            frame.active_provider = self.app.state.active_provider
+            frame.mode = self.app.state.mode
+            frame.token_count = self.app.state.total_tokens
+            try:
+                self.app.screen.query_one(ProviderGhostTable).set_active(self.app.state.active_provider)
+            except Exception:
+                pass
         except Exception:
             pass
+
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is not None:
+            from .hooks import HookEvent, HookContext
+            cli_app.hook_runner.emit(
+                HookEvent.SESSION_RESUME,
+                HookContext(
+                    event=HookEvent.SESSION_RESUME.value,
+                    provider=self.app.state.active_provider,
+                    mode=self.app.state.mode,
+                    session_id=session["id"],
+                    metadata=(("message_count", str(len(messages))),),
+                ),
+            )
 
         title = session.get("title", "(untitled)")
         self._post_system(
@@ -805,6 +1175,13 @@ class CommandHandler:
         """Export session messages to a Markdown file."""
         if not args:
             session = self.app._db_session
+            if session is None:
+                ensure_session = getattr(self.app, "ensure_session", None)
+                if callable(ensure_session):
+                    try:
+                        session = ensure_session()
+                    except Exception:
+                        session = None
             if session is None:
                 self._post_system("No active session. Use /export <session_id>.")
                 return
@@ -830,10 +1207,13 @@ class CommandHandler:
 
         lines = [f"# Cascade Session: {title}", f"Model: {model_label}", ""]
         for msg in messages:
-            if msg["role"] == "user":
+            provider_label = self._history_provider_for_message(msg, provider)
+            if provider_label == "user":
                 role = "USER"
-            else:
+            elif provider_label == provider:
                 role = model_label
+            else:
+                role = provider_label
             ts = msg.get("timestamp", "")[:19]
             lines.append(f"## {role} ({ts})")
             lines.append("")
@@ -845,6 +1225,8 @@ class CommandHandler:
 
     def _cmd_mark(self, args: list[str]) -> None:
         label = " ".join(args) if args else datetime.datetime.now().strftime("%I:%M %p")
+        command_line = f"/mark {' '.join(args)}".rstrip()
+        self._record_command_line(command_line, title=command_line)
         try:
             from rich.text import Text
             from textual.widgets import Static
@@ -857,6 +1239,7 @@ class CommandHandler:
             )
             chat.mount(sep)
             chat.scroll_end(animate=False)
+            self._record_history_message("system", f"--- {label} ---")
         except Exception:
             pass
 
@@ -867,3 +1250,364 @@ class CommandHandler:
         except Exception:
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.app.notify(f"Time: {now}")
+
+    def _cmd_swarm(self, args: list[str]) -> None:
+        """Multi-model swarm dispatch: plan, execute, synthesize."""
+        if not args:
+            self._post_system("Usage: /swarm <task description>")
+            return
+
+        objective = " ".join(args)
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is None:
+            self._post_system("Swarm requires CLI app.")
+            return
+
+        available = list(cli_app.providers.keys())
+        if len(available) < 2:
+            self._post_system(
+                f"Swarm needs 2+ providers. Have: {available}. "
+                f"Use /login to add more."
+            )
+            return
+
+        self._post_system(
+            f"Swarm dispatching: {objective}\n"
+            f"Providers: {', '.join(available)}"
+        )
+        self._record_command_line(f"/swarm {objective}", title=f"[Swarm] {objective}")
+
+        def _on_progress(stage: str, detail: str) -> None:
+            self.app.call_from_thread(self._post_system, f"[{stage}] {detail}")
+
+        def _worker() -> None:
+            try:
+                from .swarm import SwarmOrchestrator
+                swarm = SwarmOrchestrator(cli_app)
+                result = swarm.execute(objective, on_progress=_on_progress)
+
+                # Format result
+                lines = [f"Swarm complete. Providers used: {', '.join(result.providers_used)}"]
+                lines.append(f"Total tokens: {result.total_tokens:,}")
+                lines.append("")
+
+                for sr in result.subtask_results:
+                    status = "OK" if sr.success else f"FAIL: {sr.error}"
+                    lines.append(f"  [{sr.task_id}] {sr.provider}: {status}")
+
+                lines.append("")
+                lines.append("--- Synthesis ---")
+                lines.append(result.synthesis)
+
+                final = "\n".join(lines)
+                self.app.call_from_thread(self._post_system, final)
+                self.app.call_from_thread(self._record_history_message, "system", final)
+
+                # Record in state
+                self.app.call_from_thread(
+                    self.app.state.add_message,
+                    "system", f"[Swarm] {objective}",
+                )
+                # Record synthesis as a message from the orchestrator
+                if result.synthesis:
+                    from .episodes import generate_episode
+                    episode = generate_episode(
+                        user_content=f"[Swarm] {objective}",
+                        assistant_content=result.synthesis,
+                        provider="swarm",
+                        tokens=result.total_tokens,
+                    )
+                    self.app.call_from_thread(self.app.state.add_episode, episode)
+
+            except Exception as e:
+                self.app.call_from_thread(self._post_system, f"Swarm error: {e}")
+                self.app.call_from_thread(self._record_history_message, "system", f"Swarm error: {e}")
+
+        screen = self.app.screen
+        screen.run_worker(_worker, thread=True, exclusive=False)
+
+    def _cmd_compete(self, args: list[str]) -> None:
+        """Run the same task across providers and let a judge pick a winner."""
+        request = self._resolve_compete_request(args, "compete", "Competition")
+        if request is None:
+            return
+        cli_app, selected, judge_arg, objective = request
+        provider_states = {provider: "queued" for provider in selected}
+        judge_status = ""
+
+        self._post_system(
+            f"Competition dispatching: {objective}\n"
+            f"Providers: {', '.join(selected)}\n"
+            f"Judge: {judge_arg or 'auto'}"
+        )
+        self._record_command_line(
+            f"/compete {' '.join(args)}",
+            title=f"[Compete] {objective}",
+        )
+        progress = self._mount_progress_indicator(
+            self._format_progress_label(selected, provider_states)
+        )
+
+        def _call_ui(fn, *call_args) -> None:
+            caller = getattr(self.app, "call_from_thread", None)
+            if callable(caller):
+                caller(fn, *call_args)
+            else:
+                fn(*call_args)
+
+        def _on_progress(stage: str, detail: str) -> None:
+            nonlocal judge_status
+            judge_status = self._update_progress_states(
+                stage,
+                detail,
+                provider_states,
+                judge_arg or "auto",
+            ) or judge_status
+            label = self._format_progress_label(selected, provider_states, judge_status)
+            label = label[:100] if len(label) > 100 else label
+            if progress is None:
+                _call_ui(self._post_system, f"[{stage}] {detail}")
+            else:
+                _call_ui(self._set_progress_indicator_label, progress, label)
+
+        def _worker() -> None:
+            try:
+                from .swarm import CompetitionOrchestrator
+
+                compete = CompetitionOrchestrator(cli_app, judge_provider=judge_arg)
+                result = compete.execute(objective, providers=selected, on_progress=_on_progress)
+
+                lines = [f"Competition complete. Judge: {result.judge_provider}"]
+                winner_label = result.winner_provider or "none"
+                lines.append(f"Winner: {winner_label}")
+                lines.append(f"Total tokens: {result.total_tokens:,}")
+                lines.append("")
+
+                for entry in result.entries:
+                    if entry.success:
+                        status = "OK"
+                    else:
+                        status = f"FAIL: {entry.error}"
+                    lines.append(
+                        f"  [{entry.provider}] {status} "
+                        f"({entry.duration_seconds:.2f}s, {entry.tokens:,} tokens)"
+                    )
+
+                if result.judgment and result.judgment.rationale:
+                    lines.append("")
+                    lines.append(f"Judge rationale: {result.judgment.rationale}")
+                if result.judgment and result.judgment.summary:
+                    lines.append(f"Judge summary: {result.judgment.summary}")
+                if result.winner_response:
+                    lines.append("")
+                    lines.append("--- Winner ---")
+                    lines.append(result.winner_response)
+
+                final = "\n".join(lines)
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, final)
+                _call_ui(self._record_history_message, "system", final)
+
+                _call_ui(
+                    self.app.state.add_message,
+                    "system", f"[Compete] {objective}",
+                )
+                if result.winner_response:
+                    from .episodes import generate_episode
+
+                    episode = generate_episode(
+                        user_content=f"[Compete] {objective}",
+                        assistant_content=result.winner_response,
+                        provider="compete",
+                        tokens=result.total_tokens,
+                    )
+                    _call_ui(self.app.state.add_episode, episode)
+
+            except Exception as e:
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, f"Competition error: {e}")
+                _call_ui(self._record_history_message, "system", f"Competition error: {e}")
+
+        screen = self.app.screen
+        screen.run_worker(_worker, thread=True, exclusive=False)
+
+    def _cmd_compete_code(self, args: list[str]) -> None:
+        """Run the same coding task across providers in isolated git worktrees."""
+        request = self._resolve_compete_request(args, "compete-code", "Code competition")
+        if request is None:
+            return
+        cli_app, selected, judge_arg, objective = request
+        provider_states = {provider: "queued" for provider in selected}
+        judge_status = ""
+
+        self._post_system(
+            f"Code competition dispatching: {objective}\n"
+            f"Providers: {', '.join(selected)}\n"
+            f"Judge: {judge_arg or 'auto'}"
+        )
+        self._record_command_line(
+            f"/compete-code {' '.join(args)}",
+            title=f"[Compete Code] {objective}",
+        )
+        progress = self._mount_progress_indicator(
+            self._format_progress_label(selected, provider_states)
+        )
+
+        def _call_ui(fn, *call_args) -> None:
+            caller = getattr(self.app, "call_from_thread", None)
+            if callable(caller):
+                caller(fn, *call_args)
+            else:
+                fn(*call_args)
+
+        def _on_progress(stage: str, detail: str) -> None:
+            nonlocal judge_status
+            judge_status = self._update_progress_states(
+                stage,
+                detail,
+                provider_states,
+                judge_arg or "auto",
+            ) or judge_status
+            label = self._format_progress_label(selected, provider_states, judge_status)
+            label = label[:100] if len(label) > 100 else label
+            if progress is None:
+                _call_ui(self._post_system, f"[{stage}] {detail}")
+            else:
+                _call_ui(self._set_progress_indicator_label, progress, label)
+
+        def _worker() -> None:
+            try:
+                from .swarm import CompetitionOrchestrator
+
+                compete = CompetitionOrchestrator(cli_app, judge_provider=judge_arg)
+                result = compete.execute_code(objective, providers=selected, on_progress=_on_progress)
+
+                lines = [f"Code competition complete. Judge: {result.judge_provider}"]
+                winner_label = result.winner_provider or "none"
+                lines.append(f"Winner: {winner_label}")
+                lines.append(f"Total tokens: {result.total_tokens:,}")
+
+                winner_entry = next(
+                    (
+                        entry for entry in result.entries
+                        if entry.provider == result.winner_provider and entry.retained and entry.worktree_path
+                    ),
+                    None,
+                )
+                if winner_entry is not None:
+                    lines.append(f"Winner worktree: {winner_entry.worktree_path}")
+
+                lines.append("")
+
+                for entry in result.entries:
+                    status = "OK" if entry.success else f"FAIL: {entry.error}"
+                    diff_summary = self._diff_summary(entry.diff_stat, entry.changed_files)
+                    lines.append(
+                        f"  [{entry.provider}] {status} "
+                        f"({entry.duration_seconds:.2f}s, {entry.tokens:,} tokens) | {diff_summary}"
+                    )
+                    changed = ", ".join(entry.changed_files[:6]) if entry.changed_files else "no file changes"
+                    lines.append(f"    Files: {changed}")
+                    if entry.retained and entry.worktree_path:
+                        lines.append(f"    Worktree: {entry.worktree_path}")
+                    elif entry.worktree_path:
+                        lines.append("    Worktree: removed")
+
+                if result.judgment and result.judgment.rationale:
+                    lines.append("")
+                    lines.append(f"Judge rationale: {result.judgment.rationale}")
+                if result.judgment and result.judgment.summary:
+                    lines.append(f"Judge summary: {result.judgment.summary}")
+                if result.winner_response:
+                    lines.append("")
+                    lines.append("--- Winner ---")
+                    lines.append(result.winner_response)
+
+                final = "\n".join(lines)
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, final)
+                _call_ui(self._record_history_message, "system", final)
+
+                _call_ui(
+                    self.app.state.add_message,
+                    "system", f"[Compete Code] {objective}",
+                )
+                if result.winner_response:
+                    from .episodes import generate_episode
+
+                    episode = generate_episode(
+                        user_content=f"[Compete Code] {objective}",
+                        assistant_content=result.winner_response,
+                        provider="compete-code",
+                        tokens=result.total_tokens,
+                    )
+                    _call_ui(self.app.state.add_episode, episode)
+
+            except Exception as e:
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, f"Code competition error: {e}")
+                _call_ui(self._record_history_message, "system", f"Code competition error: {e}")
+
+        screen = self.app.screen
+        screen.run_worker(_worker, thread=True, exclusive=False)
+
+    def _cmd_episodes(self, args: list[str]) -> None:
+        """Show episode history."""
+        self._record_command_line("/episodes", title="/episodes")
+        episodes = self.app.state.episodes
+        if not episodes:
+            self._post_system("No episodes recorded yet.")
+            self._record_history_message("system", "No episodes recorded yet.")
+            return
+
+        lines = [f"Episode history ({len(episodes)} episodes):"]
+        for ep in episodes[-10:]:  # Show last 10
+            actions = ", ".join(ep.actions[:3]) if ep.actions else "none"
+            artifacts = ", ".join(ep.artifacts[:3]) if ep.artifacts else "none"
+            lines.append(
+                f"\n  [{ep.id}] {ep.provider}\n"
+                f"    Objective: {ep.objective[:80]}\n"
+                f"    Actions: {actions}\n"
+                f"    Files: {artifacts}\n"
+                f"    Tokens: {ep.tokens_consumed:,}"
+            )
+
+        output = "\n".join(lines)
+        self._post_system(output)
+        self._record_history_message("system", output)
+
+    def _get_branching_session(self):
+        """Lazy-init branching session for the current session."""
+        return self.app.get_branching_session()
+
+    def _cmd_tree(self, args: list[str]) -> None:
+        """Show the session branch tree."""
+        self._record_command_line("/tree", title="/tree")
+        try:
+            bs = self._get_branching_session()
+            tree_str = bs.format_tree()
+            self._post_system(tree_str)
+            self._record_history_message("system", tree_str)
+        except Exception as e:
+            self._post_system(f"Tree error: {e}")
+            self._record_history_message("system", f"Tree error: {e}")
+
+    def _cmd_branch(self, args: list[str]) -> None:
+        """Create a branch at the current point."""
+        label = " ".join(args) if args else f"branch-{len(self.app.state.messages)}"
+        self._record_command_line(f"/branch {' '.join(args)}".rstrip(), title=f"/branch {label}")
+
+        try:
+            bs = self._get_branching_session()
+            screen = self.app.screen
+            provider = getattr(screen, "_active_provider", "")
+            branch = bs.create_branch(label=label, provider=provider)
+            output = (
+                f"Branch '{branch.label}' created (id: {branch.branch_id})\n"
+                f"Branching from message: {branch.leaf_id[:12] if branch.leaf_id else 'root'}"
+            )
+            self._post_system(output)
+            self._record_history_message("system", output)
+        except Exception as e:
+            self._post_system(f"Branch error: {e}")
+            self._record_history_message("system", f"Branch error: {e}")

@@ -4,7 +4,7 @@ All hex values live here. Widgets never hardcode colors.
 """
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Collection, Dict
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +139,18 @@ MODE_CYCLE = ("design", "plan", "build", "test")
 def get_provider_theme(name: str) -> ProviderTheme:
     """Look up a provider theme by name, with a neutral fallback."""
     return PROVIDERS.get(name, _NEUTRAL)
+
+
+def get_available_modes(available_providers: Collection[str] | None = None) -> tuple[str, ...]:
+    """Return mode cycle filtered to the providers available in this session."""
+    if not available_providers:
+        return MODE_CYCLE
+    available = set(available_providers)
+    return tuple(
+        mode_name
+        for mode_name in MODE_CYCLE
+        if MODES.get(mode_name, {}).get("provider") in available
+    )
 
 
 def get_accent(provider: str) -> str:

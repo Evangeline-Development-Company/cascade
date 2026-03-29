@@ -152,6 +152,15 @@ def test_claude_get_fallback_model_opus_to_sonnet():
     assert provider_opus.get_fallback_model() == "claude-sonnet-4-20250514"
 
 
+def test_openrouter_get_fallback_model_defaults_to_minimax():
+    """OpenRouter should fall back to MiniMax when the primary model is overloaded."""
+    from cascade.providers.openrouter import OpenRouterProvider
+
+    config = ProviderConfig(api_key="fake-key", model="qwen/qwen3.5-9b")
+    provider = OpenRouterProvider(config)
+    assert provider.get_fallback_model() == "minimax/minimax-m2.5"
+
+
 def test_condense_for_cli_single_message():
     """Test _condense_for_cli with one message returns just the content."""
     config = ProviderConfig(api_key="key", model="mock")

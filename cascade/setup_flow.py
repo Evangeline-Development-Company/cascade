@@ -21,8 +21,12 @@ _ENV_VARS = {
 _DEFAULT_MODELS = {
     "gemini": "gemini-2.5-flash",
     "claude": "claude-sonnet-4-6",
-    "openrouter": "qwen/qwen3.5-35b-a3b",
+    "openrouter": "qwen/qwen3.5-9b",
     "openai": "gpt-5.3-codex",
+}
+
+_DEFAULT_FALLBACK_MODELS = {
+    "openrouter": "minimax/minimax-m2.5",
 }
 
 
@@ -143,14 +147,21 @@ class SetupWizard:
                     return False
                 api_key = answer
 
+        # Resolve provider model before validation.
+        model = self._select_model(name, _DEFAULT_MODELS.get(name, ""))
+        fallback_model = _DEFAULT_FALLBACK_MODELS.get(name)
+
         # Validate with a ping
-        model = _DEFAULT_MODELS.get(name, "")
         provider_cls = self.registry.get(name)
         if provider_cls and api_key:
             console.print(f"  Testing {name}...", style="dim", end=" ")
             try:
                 prov = provider_cls(
-                    ProviderConfig(api_key=api_key, model=model)
+                    ProviderConfig(
+                        api_key=api_key,
+                        model=model,
+                        fallback_model=fallback_model,
+                    )
                 )
                 if prov.ping():
                     console.print("OK", style="green")
@@ -165,9 +176,30 @@ class SetupWizard:
         providers[name]["enabled"] = True
         providers[name]["api_key"] = api_key
         providers[name]["model"] = model
+        if fallback_model:
+            providers[name]["fallback_model"] = fallback_model
         providers[name].setdefault("temperature", 0.7)
         providers[name].setdefault("max_tokens", 2048)
         return True
+
+    def _select_model(self, name: str, default_model: str) -> str:
+        """Resolve a provider model, prompting when customization matters."""
+        if name != "openrouter":
+            return default_model
+
+        console.print(
+            f"  OpenRouter model [default: {default_model}]",
+            style="dim",
+        )
+        console.print(
+            "  Examples: qwen/qwen3.5-9b, qwen/qwen3-coder-next, minimax/minimax-m2.5",
+            style="dim",
+        )
+        chosen = self._prompt(
+            f"  Enter model slug for {name} [{default_model}]: ",
+            default=default_model,
+        ).strip()
+        return chosen or default_model
 
     def _choose_default(self, enabled: list[str]) -> str:
         """Let the user choose a default provider."""

@@ -23,6 +23,11 @@ def test_create_session(db):
     assert "-" in session["id"]  # word-based ID like "amber-petal"
 
 
+def test_create_session_honors_requested_id(db):
+    session = db.create_session(title="Pinned", session_id="fixed-id")
+    assert session["id"] == "fixed-id"
+
+
 def test_list_sessions(db):
     db.create_session(title="First")
     db.create_session(title="Second")

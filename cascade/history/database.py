@@ -76,10 +76,18 @@ class HistoryDB:
         model: str = "",
         title: str = "",
         metadata: Optional[dict] = None,
+        session_id: Optional[str] = None,
     ) -> dict:
         """Create a new conversation session. Returns the session dict."""
         now = datetime.now(timezone.utc).isoformat()
-        session_id = self._unique_word_id()
+        if session_id:
+            exists = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if exists:
+                session_id = self._unique_word_id()
+        else:
+            session_id = self._unique_word_id()
         row = {
             "id": session_id,
             "title": title,

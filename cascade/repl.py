@@ -336,7 +336,7 @@ def main():
 
     cli_app = CLIApp()
     tui = CascadeTUI(cli_app=cli_app)
-    tui.run(mouse=False)
+    tui.run(mouse=True)
 
 
 if __name__ == "__main__":

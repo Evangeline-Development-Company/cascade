@@ -60,18 +60,24 @@ class OpenAIProvider(BaseProvider):
             return
 
         full_prompt = self._condense_for_cli(messages)
+        workdir = self.get_working_directory()
         if system:
             condensed = self._condense_system_for_cli(system)
             if condensed:
                 full_prompt = f"System instructions:\n{condensed}\n\n{full_prompt}"
 
-        cmd = [self._codex_bin, "exec", "--json", "--cd", os.getcwd()]
+        cmd = [self._codex_bin, "exec", "--json", "--cd", workdir]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
         cmd.append(full_prompt)
 
         handler = CodexEventHandler()
-        cfg = CLIProxyConfig(binary=self._codex_bin, cli_name="codex", cmd_args=cmd)
+        cfg = CLIProxyConfig(
+            binary=self._codex_bin,
+            cli_name="codex",
+            cmd_args=cmd,
+            cwd=workdir,
+        )
         yield from stream_cli_proxy(cfg, handler, self._emit_activity)
         if handler.last_usage:
             self._last_usage = handler.last_usage
@@ -156,6 +162,7 @@ class OpenAIProvider(BaseProvider):
         """OpenAI-native tool calling."""
         if self._use_cli_proxy:
             return self.ask(messages, system), []
+        self._last_usage = None
 
         return openai_ask_with_tools(
             client=self.client,
@@ -169,6 +176,7 @@ class OpenAIProvider(BaseProvider):
             system=system,
             max_rounds=max_rounds,
             on_tool_event=on_tool_event,
+            on_usage=lambda usage: setattr(self, "_last_usage", usage),
         )
 
     def compare(self, prompt: str, system: Optional[str] = None) -> dict:

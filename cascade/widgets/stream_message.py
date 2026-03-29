@@ -7,6 +7,7 @@ Detects ```fences to switch between prose and code block rendering.
 from enum import Enum, auto
 
 from rich.text import Text
+from textual.containers import Vertical
 from textual.widget import Widget
 from textual.app import ComposeResult
 from textual.widgets import Static
@@ -38,6 +39,13 @@ class StreamMessage(Widget):
         padding: 0 0 1 0;
         layout: horizontal;
     }
+
+    .stream-body {
+        width: 1fr;
+        height: auto;
+        layout: vertical;
+        padding-left: 1;
+    }
     """
 
     def __init__(self, provider: str, **kwargs) -> None:
@@ -48,18 +56,27 @@ class StreamMessage(Widget):
         self._code_buf = ""
         self._code_lang = ""
         self._prose_lines: list[str] = []
-        self._first_compose = True
         self._prose_widget: _ProseBody | None = None
+        self._body_column: Vertical | None = None
 
     def compose(self) -> ComposeResult:
         yield GutterLabel(self._provider)
-        self._prose_widget = _ProseBody("")
-        yield self._prose_widget
+        with Vertical(classes="stream-body"):
+            self._prose_widget = _ProseBody("")
+            yield self._prose_widget
+
+    def on_mount(self) -> None:
+        try:
+            self._body_column = self.query_one(".stream-body", Vertical)
+        except Exception:
+            self._body_column = None
 
     def feed(self, chunk: str) -> None:
         """Feed a streaming chunk. Handles arbitrary chunk boundaries."""
         for ch in chunk:
             self._process_char(ch)
+        if self._state == _StreamState.PROSE and self._line_buf:
+            self._refresh_prose(include_partial=True)
 
     def finish(self) -> None:
         """Flush any remaining buffered content."""
@@ -69,10 +86,12 @@ class StreamMessage(Widget):
             self._code_buf = ""
             self._state = _StreamState.PROSE
 
-        if self._line_buf.strip():
+        if self._line_buf:
             self._prose_lines.append(self._line_buf)
             self._line_buf = ""
             self._refresh_prose()
+        else:
+            self._refresh_layout()
 
     def _process_char(self, ch: str) -> None:
         if self._state == _StreamState.PROSE:
@@ -104,10 +123,14 @@ class StreamMessage(Widget):
                     self._code_buf += self._line_buf
                 self._line_buf = ""
 
-    def _refresh_prose(self) -> None:
+    def _refresh_prose(self, include_partial: bool = False) -> None:
         """Update the prose widget with accumulated lines."""
         if self._prose_widget:
-            self._prose_widget.set_content("\n".join(self._prose_lines))
+            lines = list(self._prose_lines)
+            if include_partial and self._line_buf:
+                lines.append(self._line_buf)
+            self._prose_widget.set_content("\n".join(lines))
+            self._refresh_layout()
 
     def _emit_code_block(self, code: str, language: str) -> None:
         """Mount a CodeBlock widget for completed fenced code."""
@@ -115,16 +138,24 @@ class StreamMessage(Widget):
             return
         block = CodeBlock(code, language=language or "text", provider=self._provider)
         try:
-            self.mount(block)
+            target = self._body_column or self
+            target.mount(block)
         except Exception:
             pass
         # Start a new prose widget after the code block
         self._prose_lines = []
         self._prose_widget = _ProseBody("")
         try:
-            self.mount(self._prose_widget)
+            target = self._body_column or self
+            target.mount(self._prose_widget)
         except Exception:
             pass
+        self._refresh_layout()
+
+    def _refresh_layout(self) -> None:
+        self.refresh(layout=True)
+        if self.parent is not None:
+            self.parent.refresh(layout=True)
 
 
 class _ProseBody(Static):
@@ -134,7 +165,6 @@ class _ProseBody(Static):
     _ProseBody {
         width: 1fr;
         height: auto;
-        padding-left: 1;
     }
     """
 

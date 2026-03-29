@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
 
 ACTIVITY_PREFIX = "[[cascade_activity]] "
+_JSON_MESSAGE_RE = re.compile(r'"message"\s*:\s*"([^"]+)"')
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,7 @@ class CLIProxyConfig:
     binary: str
     cli_name: str
     cmd_args: list[str]
+    cwd: Optional[str] = None
     env_overrides: dict[str, str] = field(
         default_factory=lambda: {"NO_BROWSER": "true"},
     )
@@ -137,6 +140,18 @@ class ClaudeEventHandler(CLIEventHandler):
                 yield from self._handle_stream_event(inner)
 
         elif ev_type == "assistant":
+            if event.get("error"):
+                message = event.get("message", {})
+                if isinstance(message, dict):
+                    content = message.get("content", [])
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text = block.get("text", "")
+                                if text:
+                                    self.error_lines.append(text)
+                                    break
+                return
             if not self.saw_delta:
                 message = event.get("message", {})
                 if isinstance(message, dict):
@@ -332,6 +347,67 @@ def _terminate_with_timeout(
         proc.wait()
 
 
+def _select_error_message(
+    lines: list[str],
+    fallback: str,
+) -> str:
+    """Choose the most useful message from mixed CLI stderr/stdout lines."""
+    if not lines:
+        return fallback
+
+    json_messages: list[str] = []
+    signal_lines: list[str] = []
+    fallback_lines: list[str] = []
+    signal_tokens = (
+        "error",
+        "failed",
+        "exception",
+        "status",
+        "unauthorized",
+        "forbidden",
+        "denied",
+        "not found",
+        "expired",
+        "overloaded",
+        "capacity",
+        "rate limit",
+        "rate_limit",
+        "resource_exhausted",
+        "timed out",
+        "timeout",
+        "unavailable",
+    )
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line in {"{", "}", "[", "]", "},", "],"}:
+            continue
+        if line.startswith("at "):
+            continue
+        if line.lower().startswith("warning: could not read directory"):
+            continue
+
+        match = _JSON_MESSAGE_RE.search(line)
+        if match:
+            json_messages.append(match.group(1).strip())
+            continue
+
+        fallback_lines.append(line)
+        lowered = line.lower()
+        if any(token in lowered for token in signal_tokens):
+            signal_lines.append(line)
+
+    if json_messages:
+        return json_messages[-1]
+    if signal_lines:
+        return signal_lines[-1]
+    if fallback_lines:
+        return fallback_lines[-1]
+    return fallback
+
+
 def stream_cli_proxy(
     config: CLIProxyConfig,
     handler: CLIEventHandler,
@@ -350,6 +426,7 @@ def stream_cli_proxy(
         env.setdefault(key, value)
 
     try:
+        cwd = config.cwd or os.getcwd()
         proc = subprocess.Popen(
             config.cmd_args,
             stdout=subprocess.PIPE,
@@ -357,13 +434,13 @@ def stream_cli_proxy(
             text=True,
             bufsize=1,
             env=env,
+            cwd=cwd,
         )
     except Exception as exc:
-        yield f"Error: {exc}"
-        return
+        raise RuntimeError(str(exc)) from exc
 
     if emit_activity:
-        yield f"{ACTIVITY_PREFIX}starting {config.cli_name} cli in {os.getcwd()}"
+        yield f"{ACTIVITY_PREFIX}starting {config.cli_name} cli in {cwd}"
 
     assert proc.stdout is not None
     for raw_line in proc.stdout:
@@ -389,11 +466,15 @@ def stream_cli_proxy(
     proc.wait()
 
     if proc.returncode != 0 and not handler.saw_text:
-        msg = (
-            handler.error_lines[-1]
-            if handler.error_lines
-            else f"{config.cli_name} exited with code {proc.returncode}"
+        msg = _select_error_message(
+            handler.error_lines,
+            f"{config.cli_name} exited with code {proc.returncode}",
         )
-        yield f"Error: {msg}"
+        raise RuntimeError(msg)
     elif not handler.saw_text and handler.error_lines:
-        yield f"Error: {handler.error_lines[-1]}"
+        raise RuntimeError(
+            _select_error_message(
+                handler.error_lines,
+                f"{config.cli_name} produced no assistant text",
+            )
+        )

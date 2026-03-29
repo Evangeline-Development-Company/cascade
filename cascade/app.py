@@ -7,9 +7,9 @@ Gets providers, config, hooks, tools for free via the CLI app.
 from textual.app import App
 from textual.binding import Binding
 
-from .history import HistoryDB
+from .history import BranchingSession, HistoryDB
 from .state import CascadeState
-from .theme import MODES
+from .theme import MODES, get_provider_theme
 
 
 class CascadeTUI(App):
@@ -29,12 +29,16 @@ class CascadeTUI(App):
         self.state = CascadeState()
         self.db = HistoryDB()
         self._db_session: dict | None = None
+        self._branching_session: BranchingSession | None = None
 
         # Populate state from CLI app
         if cli_app:
+            available_providers = list(cli_app.providers.keys())
             default_provider = cli_app.config.get_default_provider()
+            if available_providers and default_provider not in cli_app.providers:
+                default_provider = available_providers[0]
             self.state.active_provider = default_provider
-            # Find the mode for this provider
+            self.state.mode = get_provider_theme(default_provider).default_mode
             for mode_name, mode_cfg in MODES.items():
                 if mode_cfg["provider"] == default_provider:
                     self.state.mode = mode_name
@@ -60,6 +64,19 @@ class CascadeTUI(App):
 
     def on_mount(self) -> None:
         self.state.bind(self)
+
+        # Fire SESSION_START hook
+        if self.cli_app:
+            from .hooks import HookEvent, HookContext
+            self.cli_app.hook_runner.emit(
+                HookEvent.SESSION_START,
+                HookContext(
+                    event=HookEvent.SESSION_START.value,
+                    provider=self.state.active_provider,
+                    mode=self.state.mode,
+                    session_id=self.state.session_id,
+                ),
+            )
 
         from .screens.main import MainScreen
         providers = self.cli_app.providers if self.cli_app else {}
@@ -99,16 +116,42 @@ class CascadeTUI(App):
             if prov:
                 model = prov.config.model
 
-        self._db_session = self.db.create_session(
-            provider=provider, model=model, title="",
+        session = self.db.create_session(
+            provider=provider,
+            model=model,
+            title="",
+            session_id=self.state.session_id,
         )
-        return self._db_session
+        return self.adopt_session(session)
+
+    def adopt_session(self, session: dict) -> dict:
+        """Bind application state to an existing history session."""
+        self._db_session = session
+        self.state.set_session_id(session["id"])
+        self._branching_session = BranchingSession(self.db, session["id"])
+        return session
+
+    def get_branching_session(self) -> BranchingSession:
+        """Return the branching wrapper for the active history session."""
+        session = self.ensure_session()
+        if self._branching_session is None or self._db_session is not session:
+            self._branching_session = BranchingSession(self.db, session["id"])
+        return self._branching_session
 
     def record_message(self, role: str, content: str, token_count: int = 0) -> None:
         """Record a message to the history database."""
         session = self.ensure_session()
-        self.db.add_message(
-            session["id"], role=role, content=content, token_count=token_count,
+        branching = self.get_branching_session()
+        provider = ""
+        if role not in {"user", "system", "assistant"}:
+            provider = role
+        elif role == "assistant":
+            provider = session.get("provider", "")
+        branching.add_message(
+            role=role,
+            content=content,
+            provider=provider,
+            token_count=token_count,
         )
 
         # Auto-title from first user message

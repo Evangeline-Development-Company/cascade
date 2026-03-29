@@ -56,7 +56,8 @@ class ConfigManager:
                 "openrouter": {
                     "enabled": False,
                     "api_key": "${OPENROUTER_API_KEY}",
-                    "model": "qwen/qwen3.5-35b-a3b",
+                    "model": "qwen/qwen3.5-9b",
+                    "fallback_model": "minimax/minimax-m2.5",
                     "temperature": 0.7,
                 },
                 "openai": {
@@ -131,12 +132,14 @@ class ConfigManager:
             "gemini": "gemini-3.1-pro-preview",
             "claude": "claude-opus-4-6",
             "openai": "gpt-5.3-codex",
-            "openrouter": "qwen/qwen3.5-35b-a3b",
+            "openrouter": "qwen/qwen3.5-9b",
         }
 
         entry["enabled"] = True
         entry["api_key"] = token
         entry.setdefault("model", default_models.get(provider_name, ""))
+        if provider_name == "openrouter":
+            entry.setdefault("fallback_model", "minimax/minimax-m2.5")
         entry.setdefault("temperature", 0.7)
 
     def get_provider_config(self, provider_name: str) -> Optional[ProviderConfig]:
@@ -156,6 +159,7 @@ class ConfigManager:
             base_url=provider_data.get("base_url"),
             temperature=provider_data.get("temperature", 0.7),
             max_tokens=provider_data.get("max_tokens"),
+            fallback_model=provider_data.get("fallback_model"),
         )
 
     def _resolve_env_var(self, value: str) -> str:

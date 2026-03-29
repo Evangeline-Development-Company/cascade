@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from cascade.providers.base import ProviderConfig
 from cascade.providers.claude import ClaudeProvider
 
@@ -64,3 +66,42 @@ def test_oauth_token_without_claude_binary_returns_clear_error():
 
     chunks = list(provider.stream_single("hello"))
     assert chunks == ["Error: Claude OAuth token detected, but claude CLI is not in PATH."]
+
+
+def test_stream_cli_raises_on_authentication_failure_payload():
+    """Expired Claude OAuth output should raise instead of streaming fake assistant text."""
+
+    class _FakePopen:
+        def __init__(self, *_args, **_kwargs):
+            self.stdout = iter(
+                [
+                    '{"type":"system","subtype":"init","model":"claude-opus-4-6"}\n',
+                    (
+                        '{"type":"assistant","message":{"content":'
+                        '[{"type":"text","text":"Failed to authenticate. API Error: 401 '
+                        '{\\"type\\":\\"error\\",\\"error\\":{\\"type\\":\\"authentication_error\\",'
+                        '\\"message\\":\\"OAuth token has expired.\\"}}"}],'
+                        '"usage":{"input_tokens":0,"output_tokens":0}},'
+                        '"error":"authentication_failed"}\n'
+                    ),
+                    (
+                        '{"type":"result","subtype":"success","is_error":true,'
+                        '"result":"Failed to authenticate. API Error: 401",'
+                        '"usage":{"input_tokens":0,"output_tokens":0}}\n'
+                    ),
+                ]
+            )
+            self.returncode = 0
+
+        def wait(self):
+            return 0
+
+    with patch("cascade.providers.claude.shutil.which", return_value="/usr/bin/claude"):
+        with patch.dict("os.environ", {"CASCADE_CLAUDE_ACTIVITY": "0"}, clear=False):
+            provider = ClaudeProvider(
+                ProviderConfig(api_key="sk-ant-oat01-test-token", model="claude-opus-4-6")
+            )
+
+    with patch("cascade.providers._cli_proxy.subprocess.Popen", _FakePopen):
+        with pytest.raises(RuntimeError, match="OAuth token has expired"):
+            list(provider.stream_single("Say hello"))

@@ -6,6 +6,7 @@ tool definitions and handle tool_use/tool_result round trips.
 
 from unittest.mock import patch, MagicMock
 
+import httpx
 
 from cascade.providers.base import BaseProvider, ProviderConfig, Message
 from cascade.tools.schema import callable_to_tool_def
@@ -220,6 +221,7 @@ class TestOpenAIToolCalling:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2},
             "choices": [{
                 "message": {"content": "OK", "tool_calls": []},
                 "finish_reason": "stop",
@@ -238,6 +240,7 @@ class TestOpenAIToolCalling:
             assert "function" in tool_def
 
         assert result == "OK"
+        assert prov.last_usage == (7, 2)
 
 
 class TestOpenRouterToolCalling:
@@ -252,6 +255,7 @@ class TestOpenRouterToolCalling:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
+            "usage": {"prompt_tokens": 9, "completion_tokens": 3},
             "choices": [{
                 "message": {"content": "OK", "tool_calls": []},
                 "finish_reason": "stop",
@@ -262,3 +266,39 @@ class TestOpenRouterToolCalling:
         with patch.object(prov.client, "post", return_value=mock_response):
             result, log = prov.ask_with_tools(_msgs("test"), tools)
             assert result == "OK"
+            assert prov.last_usage == (9, 3)
+
+    def test_openrouter_tool_calling_falls_back_on_503(self):
+        from cascade.providers.openrouter import OpenRouterProvider
+
+        prov = OpenRouterProvider(
+            ProviderConfig(
+                api_key="test-key",
+                model="qwen/qwen3.5-9b",
+                fallback_model="minimax/minimax-m2.5",
+            )
+        )
+        tools = _make_tools()
+
+        first_request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        first_response = httpx.Response(503, request=first_request)
+
+        fallback_response = MagicMock()
+        fallback_response.status_code = 200
+        fallback_response.json.return_value = {
+            "choices": [{
+                "message": {"content": "OK", "tool_calls": []},
+                "finish_reason": "stop",
+            }],
+        }
+        fallback_response.raise_for_status = MagicMock()
+
+        with patch.object(prov.client, "post", side_effect=[httpx.HTTPStatusError("503", request=first_request, response=first_response), fallback_response]) as mock_post:
+            result, log = prov.ask_with_tools(_msgs("test"), tools)
+
+        assert result == "OK"
+        assert log == []
+        first_payload = mock_post.call_args_list[0].kwargs["json"]
+        second_payload = mock_post.call_args_list[1].kwargs["json"]
+        assert first_payload["model"] == "qwen/qwen3.5-9b"
+        assert second_payload["model"] == "minimax/minimax-m2.5"
