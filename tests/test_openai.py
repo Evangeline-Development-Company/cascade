@@ -1,5 +1,6 @@
 """Tests for the OpenAI provider."""
 
+from pathlib import Path
 from unittest.mock import patch
 
 from cascade.providers.base import ProviderConfig
@@ -120,3 +121,105 @@ def test_oauth_token_without_codex_binary_returns_clear_error():
 
     chunks = list(provider.stream_single("hello"))
     assert chunks == ["Error: Codex OAuth token detected, but codex CLI is not in PATH."]
+
+
+def test_cli_proxy_uses_focused_workspace_for_non_agentic_file_audit(tmp_path):
+    """Non-editing Codex requests should run in a focused scratch workspace."""
+    source_file = tmp_path / "frontend" / "src" / "lib" / "api.ts"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("export const value = 1;\n", encoding="utf-8")
+    captured = {}
+
+    def _fake_stream(cfg, handler, emit_activity):
+        captured["cwd"] = cfg.cwd
+        captured["cmd_args"] = list(cfg.cmd_args)
+        captured["prompt"] = cfg.cmd_args[-1]
+        captured["mirrored_file"] = Path(cfg.cwd, "frontend", "src", "lib", "api.ts").read_text(
+            encoding="utf-8",
+        )
+        captured["workspace_note"] = Path(cfg.cwd, "CASCADE_WORKSPACE.md").read_text(
+            encoding="utf-8",
+        )
+        handler.last_usage = (11, 3)
+        yield "OK"
+
+    with patch("cascade.providers.openai_provider.shutil.which", return_value="/usr/bin/codex"):
+        provider = OpenAIProvider(
+            ProviderConfig(api_key="eyJ.a.b", model="gpt-5.3-codex"),
+        )
+
+    with patch("cascade.providers.openai_provider.stream_cli_proxy", side_effect=_fake_stream):
+        with provider.working_directory(str(tmp_path)):
+            chunks = list(provider.stream_single(
+                "Audit frontend/src/lib/api.ts. Do not edit anything yet.",
+            ))
+
+    assert chunks == ["OK"]
+    assert captured["cwd"] != str(tmp_path)
+    assert "--skip-git-repo-check" in captured["cmd_args"]
+    assert "--ephemeral" in captured["cmd_args"]
+    assert "--sandbox" in captured["cmd_args"]
+    assert "read-only" in captured["cmd_args"]
+    assert "temporary focused workspace" in captured["prompt"]
+    assert "frontend/src/lib/api.ts" in captured["prompt"]
+    assert captured["mirrored_file"] == "export const value = 1;\n"
+    assert "Mirrored files:" in captured["workspace_note"]
+    assert provider.last_usage == (11, 3)
+
+
+def test_cli_proxy_keeps_repo_workspace_for_agentic_requests(tmp_path):
+    """Implementation prompts should keep the full repo-backed workspace."""
+    source_file = tmp_path / "frontend" / "src" / "lib" / "api.ts"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("export const value = 1;\n", encoding="utf-8")
+    captured = {}
+
+    def _fake_stream(cfg, handler, emit_activity):
+        captured["cwd"] = cfg.cwd
+        captured["cmd_args"] = list(cfg.cmd_args)
+        captured["prompt"] = cfg.cmd_args[-1]
+        yield "OK"
+
+    with patch("cascade.providers.openai_provider.shutil.which", return_value="/usr/bin/codex"):
+        provider = OpenAIProvider(
+            ProviderConfig(api_key="eyJ.a.b", model="gpt-5.3-codex"),
+        )
+
+    with patch("cascade.providers.openai_provider.stream_cli_proxy", side_effect=_fake_stream):
+        with provider.working_directory(str(tmp_path)):
+            chunks = list(provider.stream_single(
+                "Implement one safe cleanup in frontend/src/lib/api.ts and update the file directly.",
+            ))
+
+    assert chunks == ["OK"]
+    assert captured["cwd"] == str(tmp_path)
+    assert "--skip-git-repo-check" not in captured["cmd_args"]
+    assert "--ephemeral" not in captured["cmd_args"]
+    assert "--sandbox" in captured["cmd_args"]
+    assert "workspace-write" in captured["cmd_args"]
+    assert "temporary focused workspace" not in captured["prompt"]
+
+
+def test_cli_proxy_keeps_repo_workspace_for_repo_wide_audits_without_file_refs(tmp_path):
+    """Repo-wide audits without concrete files should not lose broad workspace access."""
+    captured = {}
+
+    def _fake_stream(cfg, handler, emit_activity):
+        captured["cwd"] = cfg.cwd
+        captured["cmd_args"] = list(cfg.cmd_args)
+        yield "OK"
+
+    with patch("cascade.providers.openai_provider.shutil.which", return_value="/usr/bin/codex"):
+        provider = OpenAIProvider(
+            ProviderConfig(api_key="eyJ.a.b", model="gpt-5.3-codex"),
+        )
+
+    with patch("cascade.providers.openai_provider.stream_cli_proxy", side_effect=_fake_stream):
+        with provider.working_directory(str(tmp_path)):
+            chunks = list(provider.stream_single(
+                "Give me a frontend audit of this repo and call out the riskiest areas.",
+            ))
+
+    assert chunks == ["OK"]
+    assert captured["cwd"] == str(tmp_path)
+    assert "--skip-git-repo-check" not in captured["cmd_args"]

@@ -2,7 +2,11 @@
 
 import json
 import os
+import re
 import shutil
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional, Iterator, TYPE_CHECKING
 import httpx
 from .base import BaseProvider, ProviderConfig, Message, ToolEventCallback
@@ -12,6 +16,72 @@ from .registry import register_provider
 
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
+
+
+_AGENTIC_HINTS = (
+    "apply the change",
+    "apply the winner",
+    "create ",
+    "delete ",
+    "edit ",
+    "fix ",
+    "implement ",
+    "make your changes",
+    "modify ",
+    "patch ",
+    "refactor ",
+    "rename ",
+    "run tests",
+    "save ",
+    "update ",
+    "write code",
+)
+
+_NON_AGENTIC_HINTS = (
+    "analyze ",
+    "audit ",
+    "compare ",
+    "do not edit",
+    "don't edit",
+    "explain ",
+    "rank ",
+    "review ",
+    "summarize ",
+    "what changed",
+    "which provider won",
+)
+
+_REPO_SCOPE_HINTS = (
+    "codebase",
+    "project",
+    "repo",
+    "repository",
+    "workspace",
+)
+
+_PATH_EXTENSIONS = {
+    ".c", ".cc", ".cpp", ".css", ".go", ".h", ".hpp", ".html",
+    ".java", ".js", ".json", ".jsx", ".kt", ".md", ".mjs", ".py",
+    ".rs", ".scss", ".sh", ".sql", ".svelte", ".toml", ".ts", ".tsx",
+    ".txt", ".yaml", ".yml",
+}
+
+_SKIP_DIRS = {
+    ".git",
+    ".mypy_cache",
+    ".next",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svelte-kit",
+    ".turbo",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "venv",
+}
 
 
 @register_provider("openai")
@@ -49,6 +119,224 @@ class OpenAIProvider(BaseProvider):
             "Content-Type": "application/json",
         }
 
+    def _build_cli_prompt(
+        self,
+        messages: list[Message],
+        system: Optional[str],
+    ) -> str:
+        full_prompt = self._condense_for_cli(messages)
+        if system:
+            condensed = self._condense_system_for_cli(system)
+            if condensed:
+                full_prompt = f"System instructions:\n{condensed}\n\n{full_prompt}"
+        return full_prompt
+
+    @staticmethod
+    def _latest_user_prompt(messages: list[Message]) -> str:
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return message.get("content", "")
+        return messages[-1]["content"] if messages else ""
+
+    def _should_use_repo_workspace(
+        self,
+        messages: list[Message],
+        system: Optional[str],
+        workdir: str,
+    ) -> bool:
+        prompt = self._latest_user_prompt(messages).lower()
+        if self._looks_agentic_request(prompt, system):
+            return True
+        if any(hint in prompt for hint in _NON_AGENTIC_HINTS):
+            return False
+
+        referenced_files = self._resolve_referenced_files(messages, workdir)
+        if referenced_files:
+            return False
+
+        return any(hint in prompt for hint in _REPO_SCOPE_HINTS)
+
+    @staticmethod
+    def _looks_agentic_request(prompt: str, system: Optional[str]) -> bool:
+        system_text = (system or "").lower()
+        combined = f"{system_text}\n{prompt}"
+
+        if "do not edit" in combined or "don't edit" in combined:
+            return False
+        return any(hint in combined for hint in _AGENTIC_HINTS)
+
+    @staticmethod
+    def _clean_path_token(token: str) -> str:
+        return token.strip().strip("`'\".,:;()[]{}")
+
+    def _candidate_path_tokens(self, text: str) -> list[str]:
+        candidates: list[str] = []
+        for match in re.finditer(r"(?:/|\.?/)?(?:[\w.+\-]+/)*[\w.+\-]+\.[A-Za-z0-9]+", text):
+            token = self._clean_path_token(match.group(0))
+            if not token:
+                continue
+            suffix = Path(token).suffix.lower()
+            if suffix not in _PATH_EXTENSIONS:
+                continue
+            candidates.append(token)
+        return candidates
+
+    def _resolve_candidate_path(self, token: str, root: Path) -> Optional[Path]:
+        candidate = Path(token)
+        if candidate.is_absolute():
+            try:
+                resolved = candidate.resolve()
+            except FileNotFoundError:
+                return None
+            return resolved if resolved.is_file() else None
+
+        resolved = (root / candidate).resolve()
+        if resolved.is_file():
+            return resolved
+        return None
+
+    def _find_filename_match(self, filename: str, root: Path) -> Optional[Path]:
+        for current_root, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
+            if filename in filenames:
+                path = Path(current_root, filename)
+                if path.is_file():
+                    return path
+        return None
+
+    def _resolve_referenced_files(self, messages: list[Message], workdir: str) -> list[Path]:
+        root = Path(workdir).resolve()
+        resolved: list[Path] = []
+        seen: set[Path] = set()
+
+        for message in reversed(messages[-8:]):
+            for token in self._candidate_path_tokens(message.get("content", "")):
+                path = self._resolve_candidate_path(token, root)
+                if path is None or path in seen:
+                    continue
+                seen.add(path)
+                resolved.append(path)
+                if len(resolved) >= 8:
+                    return resolved
+
+        if resolved:
+            return resolved
+
+        for message in reversed(messages[-6:]):
+            for token in re.findall(r"\b[\w.+\-]+\.[A-Za-z0-9]+\b", message.get("content", "")):
+                cleaned = self._clean_path_token(token)
+                suffix = Path(cleaned).suffix.lower()
+                if suffix not in _PATH_EXTENSIONS:
+                    continue
+                path = self._find_filename_match(cleaned, root)
+                if path is None or path in seen:
+                    continue
+                seen.add(path)
+                resolved.append(path)
+                if len(resolved) >= 8:
+                    return resolved
+
+        return resolved
+
+    @staticmethod
+    def _line_count(path: Path) -> int:
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                return sum(1 for _ in handle)
+        except Exception:
+            return 0
+
+    def _mirror_focused_files(
+        self,
+        source_root: Path,
+        scratch_root: Path,
+        files: list[Path],
+    ) -> list[str]:
+        mirrored: list[str] = []
+        for path in files:
+            try:
+                relative = path.relative_to(source_root)
+            except ValueError:
+                relative = Path(path.name)
+            target = scratch_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            mirrored.append(relative.as_posix())
+
+        note_lines = [
+            "# Focused Codex workspace",
+            "",
+            "This temporary workspace contains only the files Cascade selected for this request.",
+            f"Source root: {source_root}",
+        ]
+        if mirrored:
+            note_lines.extend(["", "Mirrored files:"])
+            note_lines.extend(f"- {rel}" for rel in mirrored)
+        else:
+            note_lines.extend(["", "No repository files were mirrored for this request."])
+        (scratch_root / "CASCADE_WORKSPACE.md").write_text(
+            "\n".join(note_lines) + "\n",
+            encoding="utf-8",
+        )
+        return mirrored
+
+    def _augment_prompt_for_focused_workspace(
+        self,
+        prompt: str,
+        files: list[Path],
+        source_root: Path,
+    ) -> str:
+        note_lines = [
+            "Workspace note:",
+            "- You are running in a temporary focused workspace, not the full repository.",
+            f"- Original repository root: {source_root}",
+        ]
+        if files:
+            note_lines.append("- Cascade mirrored only these referenced files into the workspace:")
+            for path in files:
+                try:
+                    relative = path.relative_to(source_root).as_posix()
+                except ValueError:
+                    relative = path.name
+                line_count = self._line_count(path)
+                suffix = f" ({line_count} lines)" if line_count else ""
+                note_lines.append(f"  - {relative}{suffix}")
+        else:
+            note_lines.append("- No repository files were mirrored for this request.")
+        note_lines.append(
+            "- If you need broader repository context, say that explicitly instead of assuming it."
+        )
+        return "\n".join(note_lines) + "\n\n" + prompt
+
+    @contextmanager
+    def _cli_workspace(
+        self,
+        messages: list[Message],
+        system: Optional[str],
+    ):
+        prompt = self._build_cli_prompt(messages, system)
+        workdir = self.get_working_directory()
+        if self._should_use_repo_workspace(messages, system, workdir):
+            yield prompt, workdir, None
+            return
+
+        referenced_files = self._resolve_referenced_files(messages, workdir)
+        prompt_lower = self._latest_user_prompt(messages).lower()
+        if not referenced_files and any(hint in prompt_lower for hint in _REPO_SCOPE_HINTS):
+            yield prompt, workdir, None
+            return
+
+        source_root = Path(workdir).resolve()
+        with tempfile.TemporaryDirectory(prefix="cascade-codex-") as scratch_dir:
+            scratch_root = Path(scratch_dir)
+            self._mirror_focused_files(source_root, scratch_root, referenced_files)
+            focused_prompt = self._augment_prompt_for_focused_workspace(
+                prompt,
+                referenced_files,
+                source_root,
+            )
+            yield focused_prompt, str(scratch_root), scratch_root
+
     def _stream_via_cli(
         self,
         messages: list[Message],
@@ -59,28 +347,26 @@ class OpenAIProvider(BaseProvider):
             yield "Error: codex CLI not found in PATH for OAuth mode."
             return
 
-        full_prompt = self._condense_for_cli(messages)
-        workdir = self.get_working_directory()
-        if system:
-            condensed = self._condense_system_for_cli(system)
-            if condensed:
-                full_prompt = f"System instructions:\n{condensed}\n\n{full_prompt}"
+        with self._cli_workspace(messages, system) as (full_prompt, workdir, scratch_root):
+            cmd = [self._codex_bin, "exec", "--json", "--cd", workdir]
+            if scratch_root is not None:
+                cmd.extend(["--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only"])
+            elif self._looks_agentic_request(self._latest_user_prompt(messages).lower(), system):
+                cmd.extend(["--sandbox", "workspace-write"])
+            if self.config.model:
+                cmd.extend(["--model", self.config.model])
+            cmd.append(full_prompt)
 
-        cmd = [self._codex_bin, "exec", "--json", "--cd", workdir]
-        if self.config.model:
-            cmd.extend(["--model", self.config.model])
-        cmd.append(full_prompt)
-
-        handler = CodexEventHandler()
-        cfg = CLIProxyConfig(
-            binary=self._codex_bin,
-            cli_name="codex",
-            cmd_args=cmd,
-            cwd=workdir,
-        )
-        yield from stream_cli_proxy(cfg, handler, self._emit_activity)
-        if handler.last_usage:
-            self._last_usage = handler.last_usage
+            handler = CodexEventHandler()
+            cfg = CLIProxyConfig(
+                binary=self._codex_bin,
+                cli_name="codex",
+                cmd_args=cmd,
+                cwd=workdir,
+            )
+            yield from stream_cli_proxy(cfg, handler, self._emit_activity)
+            if handler.last_usage:
+                self._last_usage = handler.last_usage
 
     def ask(self, messages: list[Message], system: Optional[str] = None) -> str:
         """Get a complete response from OpenAI."""
